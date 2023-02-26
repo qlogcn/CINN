@@ -34,21 +34,26 @@ class TaskOptimizer {
  public:
   TaskOptimizer(const TuneTask& task, ScheduleMeasurer* schedule_measurer, Database* database);
 
-  TuningResult::OptimizedComputeExpr Optimize(const TuningOptions& options);
+  FunctionGroup Optimize(const TuningOptions& options);
 
  private:
-  TuningResult::OptimizedComputeExpr OptimizeByEvolution(const TuningOptions& options);
+  FunctionGroup OptimizeByEvolution(const TuningOptions& options);
+
+  // call search candidates once by EvolutionarySearch and prune invalid ones
+  std::vector<SearchState> SearchOneRound(const TuningOptions& options, std::vector<MeasureInput>* measure_candidates);
 
   ir::LoweredFunc FuncWithUpdatedBody(const ir::LoweredFunc& old_func, ir::Expr& body);
 
+  // check whther a scheduled lowered function is valid
+  bool PruneInvalid(const ir::LoweredFunc& lowered_func);
+
+ private:
+  // the max retry times if continuously get empty result
+  static constexpr uint32_t kMaxRetryContinuousEmpty_ = 3;
   const TuneTask* task_;
-
   ScheduleMeasurer* schedule_measurer_;
-
   std::unique_ptr<EvolutionarySearch> evolutionary_search_ = nullptr;
-
   ExprCostModel cost_model_;
-
   Database* database_;
 };
 

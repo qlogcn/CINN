@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-project(CINN)
+project(CINN CXX C)
 
 set(CMAKE_CXX_STANDARD 14)
 
@@ -23,6 +23,12 @@ option(PY_VERSION           "Python version"                        ${PY_VERSION
 
 if (NOT PY_VERSION)
   set(PY_VERSION 3.6)
+endif()
+
+if (NOT DEFINED ENV{runtime_include_dir})
+  message(STATUS "set runtime_include_dir: ${CMAKE_SOURCE_DIR}/cinn/runtime/cuda")
+  set(ENV{runtime_include_dir} "${CMAKE_SOURCE_DIR}/cinn/runtime/cuda")
+  add_definitions(-DRUNTIME_INCLUDE_DIR="${CMAKE_SOURCE_DIR}/cinn/runtime/cuda")
 endif()
 
 if (WITH_TESTING)
@@ -52,9 +58,14 @@ if (WITH_CUDA)
   include_directories(/usr/lib/x86_64-linux-gnu)
   set(CUDA_SEPARABLE_COMPILATION ON)
 
+  message(STATUS "copy cinn/common/float16.h to $ENV{runtime_include_dir}")
+  file(COPY cinn/common/float16.h DESTINATION $ENV{runtime_include_dir})
+
   find_library(CUDASTUB libcuda.so HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs/ REQUIRED)
   find_library(CUBLAS libcublas.so HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64 /usr/lib REQUIRED)
   find_library(CUDNN libcudnn.so HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64 /usr/lib REQUIRED)
+  find_library(CURAND libcurand.so HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64 /usr/lib REQUIRED)
+  find_library(CUSOLVER libcusolver.so HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64 /usr/lib REQUIRED)
 endif()
 
 find_package(Threads REQUIRED)
@@ -90,6 +101,21 @@ find_package(Threads REQUIRED)
 set(LINK_FLAGS "-Wl,--version-script ${CMAKE_CURRENT_SOURCE_DIR}/cmake/export.map" CACHE INTERNAL "")
 set(global_test_args "--cinn_x86_builtin_code_root=${CMAKE_SOURCE_DIR}/cinn/backends")
 
+set(Python_VIRTUALENV FIRST)
+
+if(NOT PYTHON_EXECUTABLE)
+find_package(PythonInterp ${PY_VERSION} REQUIRED)
+endif()
+
+if(NOT PYTHON_LIBRARIES)
+find_package(PythonLibs ${PY_VERSION} REQUIRED)
+endif()
+
+message(STATUS "PYTHON_LIBRARIES: ${PYTHON_LIBRARIES}")
+message(STATUS "PYTHON_INCLUDE_DIR: ${PYTHON_INCLUDE_DIR}")
+
+INCLUDE_DIRECTORIES(${PYTHON_INCLUDE_DIR})
+
 set(core_deps CACHE INTERNAL "" FORCE)
 set(hlir_src CACHE INTERNAL "" FORCE)
 add_subdirectory(cinn)
@@ -101,13 +127,6 @@ add_subdirectory(tutorials)
 
 set(core_src "${cinnapi_src}")
 
-set(Python_VIRTUALENV FIRST)
-find_package(PythonInterp ${PY_VERSION} REQUIRED)
-find_package(PythonLibs ${PY_VERSION} REQUIRED)
-message(STATUS "PYTHON_LIBRARIES: ${PYTHON_LIBRARIES}")
-message(STATUS "PYTHON_INCLUDE_DIR: ${PYTHON_INCLUDE_DIR}")
-
-INCLUDE_DIRECTORIES(${PYTHON_INCLUDE_DIR})
 cc_library(cinnapi SHARED SRCS ${cinnapi_src} DEPS glog ${llvm_libs} framework_proto param_proto
  auto_schedule_proto schedule_desc_proto absl isl ginac pybind ${jitify_deps})
 add_dependencies(cinnapi GEN_LLVM_RUNTIME_IR_HEADER ZLIB::ZLIB)
@@ -125,7 +144,7 @@ if (WITH_MKL_CBLAS)
 endif()
 
 if (WITH_CUDA)
-  target_link_libraries(cinnapi ${CUDA_NVRTC_LIB} ${CUDA_LIBRARIES} ${CUDASTUB} ${CUBLAS} ${CUDNN})
+  target_link_libraries(cinnapi ${CUDA_NVRTC_LIB} ${CUDA_LIBRARIES} ${CUDASTUB} ${CUBLAS} ${CUDNN} ${CURAND} ${CUSOLVER})
   if (NVTX_FOUND)
     target_link_libraries(cinnapi ${CUDA_NVTX_LIB})
   endif()
@@ -153,8 +172,8 @@ function(gen_cinncore LINKTYPE)
   endif()
 
   if (WITH_CUDA)
-    target_link_libraries(${CINNCORE_TARGET} ${CUDA_NVRTC_LIB} ${CUDA_LIBRARIES} ${CUDASTUB} ${CUBLAS} ${CUDNN} 
-      ${jitify_deps})
+    target_link_libraries(${CINNCORE_TARGET} ${CUDA_NVRTC_LIB} ${CUDA_LIBRARIES} ${CUDASTUB} ${CUBLAS} ${CUDNN}
+      ${CURAND} ${CUSOLVER} ${jitify_deps})
     if (NVTX_FOUND)
       target_link_libraries(${CINNCORE_TARGET} ${CUDA_NVTX_LIB})
     endif()

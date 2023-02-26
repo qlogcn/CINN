@@ -45,7 +45,9 @@ using ir::Tensor;
 
 std::string Type2StrForNN(common::Type type) {
   std::string suffix;
-  if (type.is_float(32)) {
+  if (type.is_float(64)) {
+    return "fp64";
+  } else if (type.is_float(32)) {
     return "fp32";
   } else if (type.is_float(16)) {
     return "fp16";
@@ -634,7 +636,7 @@ std::vector<Tensor> Depthwise_Conv2d_NCHW(const Tensor &input,
 
   Var kernel_h = Var(weight->shape[2], "kh");
   Var kernel_w = Var(weight->shape[3], "kw");
-  VLOG(3) << "Output shape is : " << utils::Join(output_shape, ",");
+  VLOG(3) << "Output shape is : " << cinn::utils::Join(output_shape, ",");
   auto res = Compute(
       output_shape,
       [=](Expr nn, Expr ff, Expr yy, Expr xx) {
@@ -953,7 +955,7 @@ std::vector<Tensor> PoolImpl(const Tensor &tensor,
                              const std::vector<int> &kernel_size,
                              const std::vector<int> &stride_size,
                              const std::vector<int> &padding_size,
-                             const std::string &pool_type,
+                             const std::string &pooling_type,
                              const std::vector<int> &axis,
                              bool ceil_mode,
                              bool exclusive,
@@ -965,6 +967,12 @@ std::vector<Tensor> PoolImpl(const Tensor &tensor,
   CHECK_EQ(stride_size.size(), k_size) << "Pooling stride_size must have same elements as kernel\n";
   CHECK_EQ(padding_size.size(), k_size * 2) << "Pooling padding_size must have double elements as kernel\n";
   CHECK_EQ(axis.size(), k_size) << "Axis must have same elements as kernel\n";
+
+  std::string pool_type;
+  std::transform(pooling_type.begin(), pooling_type.end(), std::back_inserter(pool_type), [](unsigned char c) {
+    return std::tolower(c);
+  });
+  CHECK(pool_type == "max" || pool_type == "avg") << "pool_type for pool2d should be max or avg.\n";
 
   std::vector<Var> daxis;
   std::vector<Expr> kernel(k_size);
@@ -1046,14 +1054,14 @@ std::vector<Tensor> PoolImpl(const Tensor &tensor,
             }
             common::AutoSimplify(temp_factor);
             Expr divide_factor = Max::Make(temp_factor, make_const(Int(32), 1));
-            return lang::ReduceSum(ir::Div::Make(temp(indices), cast(divide_factor, Float(32))), {daxis});
+            return lang::ReduceSum(ir::Div::Make(temp(indices), ir::Cast::Make(temp->type(), divide_factor)), {daxis});
           } else {
             auto temp_factor = make_const(Int(32), 1);
             for (int i = 0; i < k_size; i++) {
               temp_factor = temp_factor * kernel[i];
             }
             common::AutoSimplify(temp_factor);
-            return lang::ReduceSum(ir::Div::Make(temp(indices), cast(temp_factor, Float(32))), daxis);
+            return lang::ReduceSum(ir::Div::Make(temp(indices), ir::Cast::Make(temp->type(), temp_factor)), daxis);
           }
         },
         output_name);
@@ -1068,7 +1076,7 @@ std::vector<Tensor> PoolImpl(const Tensor &tensor,
     for (int i = 0; i < k_size; i++) {
       out_shape[axis[i]] = Expr(kernel_size[i]);
     }
-    VLOG(4) << "PoolImpl out_shape: " << utils::Join(out_shape, ",");
+    VLOG(4) << "PoolImpl out_shape: " << cinn::utils::Join(out_shape, ",");
     CHECK(!do_pad);
     temp = do_pad ? Pad(tensor, pad_before, pad_after, 0, UniqName("pad_temp")) : tensor;
     std::vector<Var> reduce_axis;
@@ -1096,7 +1104,8 @@ std::vector<Tensor> PoolImpl(const Tensor &tensor,
           }
           common::AutoSimplify(temp_factor);
           Expr divide_factor = Max::Make(temp_factor, make_const(Int(32), 1));
-          return lang::ReduceSum(ir::Div::Make(temp(indices), cast(divide_factor, Float(32))), {reduce_axis});
+          return lang::ReduceSum(ir::Div::Make(temp(indices), ir::Cast::Make(temp->type(), divide_factor)),
+                                 {reduce_axis});
         },
         output_name);
   }

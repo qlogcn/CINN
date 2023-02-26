@@ -27,6 +27,17 @@ namespace cinn {
 namespace hlir {
 namespace pe {
 
+namespace utils {
+std::vector<std::vector<int>> GetMatmulNewShapes(const std::vector<std::vector<int>>& inputs_shape,
+                                                 bool trans_x,
+                                                 bool trans_y);
+
+std::vector<std::vector<int>> GetMulNewShapes(const std::vector<std::vector<int>>& inputs_shape,
+                                              int x_num_col_dims,
+                                              int y_num_col_dims,
+                                              bool is_infer = false);
+}  // namespace utils
+
 /**
  * @brief basic PE that calculates a matrix multiplication
  *
@@ -52,10 +63,6 @@ ir::Tensor Reshape(const ir::Tensor& A,
                    const std::vector<int>& new_shape,
                    poly::StageMap stages,
                    const std::string& name);
-
-ir::Tensor Reshape(const ir::Tensor& A,
-                   const std::vector<int>& new_shape,
-                   const std::string& name = UniqName("T_Transform_Matmul_out"));
 
 ir::Tensor Concat(const ir::Tensor& A,
                   const ir::Tensor& B,
@@ -143,7 +150,7 @@ ir::Tensor Transpose(const ir::Tensor& input,
                      const std::string& output_name = UniqName("T_Transpose_out"));
 
 /**
- * @brief Perform meta op IndexSelect
+ * @brief Perform meta op Split
  * @param x The input tensor
  * @param index The index tensor
  * @param output_shape The output tensor shape
@@ -159,6 +166,7 @@ ir::Tensor Slice(const ir::Tensor& A,
                  const std::vector<int>& starts,
                  const std::vector<int>& axes,
                  const std::vector<int>& strides,
+                 const std::vector<int>& decrease_axis,
                  const std::vector<Expr>& output_shape,
                  const std::string& output_name);
 
@@ -185,11 +193,11 @@ ir::Tensor SliceAssign(const ir::Tensor& input,
  * @param output_shapes The output sub-tensors shape
  * @param output_name the name of the output tensor
  */
-ir::Tensor IndexSelect(const ir::Tensor& x,
-                       const ir::Tensor& index,
-                       const std::vector<Expr>& output_shape,
-                       int axis                = 0,
-                       const std::string& name = UniqName("T_Transform_IndexSelect_out"));
+ir::Tensor Gather(const ir::Tensor& x,
+                  const ir::Tensor& index,
+                  const std::vector<Expr>& output_shape,
+                  int axis                = 0,
+                  const std::string& name = UniqName("T_Transform_Gather_out"));
 
 /**
  * @brief Perform meta op ScatterAssign
@@ -218,11 +226,6 @@ ir::Tensor ScatterAdd(const ir::Tensor& input,
                       const common::Target& target,
                       const int axis,
                       const std::string& output_name);
-
-ir::Tensor ExpandDims(const ir::Tensor& input,
-                      int axis,
-                      int num_newaxis                = 1,
-                      const std::string& output_name = UniqName("T_Transform_ExpandDims_out"));
 
 }  // namespace pe
 }  // namespace hlir

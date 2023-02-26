@@ -121,12 +121,14 @@ void PaddleModelToProgram::AddOpMapper_mul() {
     auto y             = GetVar(utils::TransValidVarName(y_name));
     int x_num_col_dims = op_desc.GetAttr<int>("x_num_col_dims");
     int y_num_col_dims = op_desc.GetAttr<int>("y_num_col_dims");
-    CHECK_EQ(y_num_col_dims, 1) << "The y_num_col_dims of mul is not 1! Please check.";
+
     VLOG(4) << "Mul x_num_col_dims: " << x_num_col_dims;
     VLOG(4) << "Mul y_num_col_dims: " << y_num_col_dims;
     VLOG(4) << "x shape: " << utils::Join(x->shape, ",");
     VLOG(4) << "y shape: " << utils::Join(y->shape, ",");
-    auto out = net_builder_->Mul(x, y, x_num_col_dims, y_num_col_dims);
+
+    const auto& out = net_builder_->Mul(x, y, x_num_col_dims, y_num_col_dims, true);
+
     CHECK_EQ(op_desc.Output("Out").size(), 1UL);
     auto out_name = op_desc.Output("Out").front();
     AddVar(utils::TransValidVarName(out_name), out);
@@ -301,7 +303,7 @@ void PaddleModelToProgram::AddOpMapper_softmax() {
       axis = static_cast<int>(-1);
     }
     auto x   = GetVar(TransValidVarName(x_name));
-    auto out = net_builder_->Softmax(x, axis);
+    auto out = net_builder_->Softmax(x, {axis});
     AddVar(TransValidVarName(out_name), out);
     var_model_to_program_map_[out_name] = out->id;
   };
@@ -485,11 +487,6 @@ void PaddleModelToProgram::AddOpMapper_pool2d() {
     auto strides = op_desc.GetAttr<std::vector<int>>("strides");
     CHECK(op_desc.HasAttr("paddings"));
     auto paddings = op_desc.GetAttr<std::vector<int>>("paddings");
-
-    if (paddings.size() == 2) {
-      paddings.insert(paddings.begin(), paddings.front());
-      paddings.push_back(paddings.back());
-    }
     CHECK(op_desc.HasAttr("ceil_mode"));
     auto ceil_mode = op_desc.GetAttr<bool>("ceil_mode");
     CHECK(op_desc.HasAttr("exclusive"));

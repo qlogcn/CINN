@@ -119,8 +119,27 @@ void GetBroadcastShape(const std::vector<Expr>& shape1,
       broadcast_flag1->emplace_back(true);
       broadcast_flag2->emplace_back(true);
     } else {
-      LOG(FATAL) << "Incompatible broadcast dims " << shape1_new[size1 - i] << " and " << shape2_new[size2 - i]
-                 << " in: " << shape1_new << " and " << shape2_new << std::endl;
+      int dim1 = shape1_new[size1 - i].as_int32();
+      int dim2 = shape2_new[size2 - i].as_int32();
+      if (dim1 == dim2) {
+        common_shape->insert(common_shape->begin(), shape1_new[size1 - i]);
+        // broadcast flags are recorded in a reverse order
+        broadcast_flag1->emplace_back(true);
+        broadcast_flag2->emplace_back(true);
+      } else if (dim1 == 1) {
+        common_shape->insert(common_shape->begin(), shape2_new[size2 - i]);
+        // broadcast flags are recorded in a reverse order
+        broadcast_flag1->emplace_back(false);
+        broadcast_flag2->emplace_back(true);
+      } else if (dim2 == 1) {
+        common_shape->insert(common_shape->begin(), shape1_new[size1 - i]);
+        // broadcast flags are recorded in a reverse order
+        broadcast_flag1->emplace_back(true);
+        broadcast_flag2->emplace_back(false);
+      } else {
+        LOG(FATAL) << "Incompatible broadcast dims " << shape1_new[size1 - i] << " and " << shape2_new[size2 - i]
+                   << " in: " << shape1_new << " and " << shape2_new << std::endl;
+      }
     }
   }
   if (size1 != size2) {
@@ -236,6 +255,7 @@ HLIR_IMP_BC_PE(Maximum, return ir::Max::Make(a, b););
 HLIR_IMP_BC_PE(Minimum, return ir::Min::Make(a, b););
 HLIR_IMP_BC_PE(LeftShift, return a << b;);
 HLIR_IMP_BC_PE(RightShift, return a >> b;);
+HLIR_IMP_BC_PE(LogicalRightShift, return lang::LogicalRightShift(a, b););
 HLIR_IMP_BC_PE(LogicalAnd, return a && b;);
 HLIR_IMP_BC_PE(LogicalOr, return a || b;);
 HLIR_IMP_BC_PE(LogicalXOr, return (a || b) && !(a && b););
@@ -248,36 +268,22 @@ HLIR_IMP_BC_PE(Equal, return ir::EQ::Make(a, b););
 HLIR_IMP_BC_PE(NotEqual, return ir::NE::Make(a, b););
 HLIR_IMP_BC_PE(GreaterEqual, return a >= b;);
 HLIR_IMP_BC_PE(LessEqual, return a <= b;);
+HLIR_IMP_BC_PE(Pow, return lang::Pow(a, b););
 
-Tensor Pow(
-    const Tensor& A, const Tensor& B, const std::string& output_name, const Expr& axis, const common::Target& target) {
-  CHECK_EQ(A->type(), B->type()) << "The data type of input tensors of pow op should be equal, but here x:" << A->type()
-                                 << " != y:" << B->type() << "! Please check.";
+Tensor Atan2(const Tensor& A, const Tensor& B, const std::string& output_name, const Expr& axis) {
+  constexpr double PI = 3.14159265358979323846;
 
-  std::string extern_func_name = "cinn_";
-  if (target == common::DefaultNVGPUTarget()) {
-    extern_func_name += "nvgpu_";
-  } else if (target == common::DefaultHostTarget()) {
-    extern_func_name += "host_";
-  } else {
-    LOG(FATAL) << "Pow op only support nvgpu and host now, but here " << target << "! Please check.";
-  }
-
-  extern_func_name += "pow_";
-
-  if (A->type().is_float(64)) {
-    extern_func_name += "fp64";
-  } else if (A->type().is_float(32)) {
-    extern_func_name += "fp32";
-  } else if (A->type().is_float(16)) {
-    extern_func_name += "fp16";
-  } else if (A->type().is_int(32)) {
-    extern_func_name += "int32";
-  } else {
-    LOG(FATAL) << "Pow op only support float16/float64/float32/int32 now, but here " << A->type() << "! Please check.";
-  }
-
-  auto fn = [&](const Expr& a, const Expr& b) { return lang::CallExtern(extern_func_name, {a, b}); };
+  auto fn = [&](const Expr& elem_a, const Expr& elem_b) {
+    auto atan    = lang::Atan(elem_a / elem_b);
+    auto pi      = common::make_const(atan->type(), PI);
+    auto half_pi = common::make_const(atan->type(), PI / 2);
+    auto zero    = ir::Zero(atan->type());
+    return ir::Select::Make(
+        ir::EQ::Make(elem_b, zero),
+        ir::Select::Make(ir::GT::Make(elem_a, zero), half_pi, -half_pi),
+        ir::Select::Make(
+            ir::GT::Make(elem_b, zero), atan, ir::Select::Make(ir::GE::Make(elem_a, zero), atan + pi, atan - pi)));
+  };
   return Broadcast(fn, A, B, output_name, axis);
 }
 
@@ -288,20 +294,29 @@ Tensor BroadcastTo(const Tensor& A,
   auto A_shape = A->shape;
   CHECK_EQ(A_shape.size(), broadcast_axes.size()) << "broadcast_axes's size should be same with the input shape's size";
   CHECK_GE(out_shape.size(), broadcast_axes.size()) << "broadcast_axes's size should be no more than out_shape's size";
+  auto axes = broadcast_axes;
+  for (auto& axis : axes) {
+    // if axis < 0, plus out_shape.size
+    if (axis < 0) {
+      axis = out_shape.size() + axis;
+    }
+    CHECK_LT(axis, out_shape.size());
+  }
+  std::sort(axes.begin(), axes.end());
 
   return Compute(
       ToCinnExprs(out_shape),
       [=](const std::vector<Expr>& indice) {
         std::vector<Expr> broadcast_indice;
-        for (int i = 0; i < broadcast_axes.size(); i++) {
-          int a_shape_i = A_shape[i].as_int32();
-          CHECK(broadcast_axes[i] >= 0 && broadcast_axes[i] < out_shape.size())
-              << "broadcast_axis should be no less than 0 and no more than out_shape's dim. Current broadcast axis is "
-              << broadcast_axes[i];
-          CHECK(a_shape_i == 1 || a_shape_i == out_shape[broadcast_axes[i]])
-              << "broadcast_shape should be 1 or same with the target mapping dim, but get " << A_shape[i] << " and "
-              << out_shape[broadcast_axes[i]];
-          broadcast_indice.push_back(indice[broadcast_axes[i]] % A_shape[i]);
+        for (int idx = 0; idx < axes.size(); ++idx) {
+          int a_shape_i = A_shape[idx].as_int32();
+          if (a_shape_i == 1) {
+            broadcast_indice.push_back(ir::Expr(0));
+          } else if (a_shape_i == out_shape[axes[idx]]) {
+            broadcast_indice.push_back(indice[axes[idx]]);
+          } else {
+            LOG(FATAL) << "fail to broad cast input shape " << a_shape_i << " to output shape " << out_shape[axes[idx]];
+          }
         }
         return A(broadcast_indice);
       },

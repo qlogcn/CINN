@@ -16,6 +16,7 @@
 
 #include <string>
 
+#include "cinn/auto_schedule/search_space/search_state.h"
 #include "cinn/common/target.h"
 #include "cinn/ir/ir_schedule.h"
 
@@ -25,17 +26,14 @@ namespace auto_schedule {
  * Enum class representing how this rule can be applied to a ModuleExpr.
  */
 enum class RuleApplyType : int {
-  // This rule cannot be applied to ModuleExpr
+  // This rule cannot be applied to ModuleExpr.
   kCannotApply = 0,
-  // This rule can be applied to ModuleExpr
+  // This rule can be applied to ModuleExpr,
+  // and the original ModuleExpr will be retained for branching with other rules.
   kApply = 1,
-  // This rule can be applied, but after applying, we should skip this rule
-  // to apply on the module again.
-  kApplyAndSkipThisRule = 2,
-  // This rule can be applied, but after applying, we should skip all rules
-  kApplyAndSkipAllRules = 3,
-  // This rule can be applied, but after applying, we need to re-initialize
-  kApplyAndNeedInit = 4
+  // This rule can be applied, but the original ModuleExpr will be deleted,
+  // so the branches with other rules applied on the original ModuleExpr will be pruned.
+  kApplyAndPruneOtherRules = 2,
 };
 
 /**
@@ -66,6 +64,12 @@ class AutoGenRule {
 
   // Returns the name of the rule, used for debug.
   virtual std::string GetRuleName() const = 0;
+
+  // Analyze the ApplyType of the rule used for a block determined by a specific SearchState and block name
+  virtual RuleApplyType AnalyseApplyType(SearchState state, const std::string& block_name) const = 0;
+
+  // Apply the rule to a block determined by a specific SearchState and block name
+  virtual std::vector<SearchState> ApplyOnBlock(SearchState state, const std::string& block_name) = 0;
 
  protected:
   // number of ScheduleBlock that can apply this auto gen rule

@@ -71,13 +71,18 @@ namespace frontend {
   macro__(BitwiseNot) \
   macro__(Negative) \
   macro__(Sign) \
-  macro__(Abs)
+  macro__(Abs) \
+  macro__(Cbrt) \
+  macro__(Clz) \
+  macro__(Popc) \
+  macro__(Reciprocal)
 
 // ******************************************* //
 // The op has two input and one output, with a attribute [axis]
 // Variable BINARY_OP(const Variable& lhs, const Variable& rhs, int axis = -1);
 #define NETBUILDER_BINARY_OP_FOREACH(macro__) \
   macro__(Add) \
+  macro__(Atan2) \
   macro__(Subtract) \
   macro__(Divide) \
   macro__(Multiply) \
@@ -100,7 +105,8 @@ namespace frontend {
   macro__(GreaterThan) \
   macro__(LessThan) \
   macro__(GreaterEqual) \
-  macro__(LessEqual)
+  macro__(LessEqual) \
+  macro__(LogicalRightShift)
 
 // ******************************************* //
 // Reduce array elements over the given dims.
@@ -221,7 +227,7 @@ class NetBuilder {
 #undef NETBUILDER_UNARY_OP_DECL
 
   /**
-   * @brief Compute each each element in `lhs` variable and `rhs` variable in `axis` dimension, and return the result
+   * @brief Compute each element in `lhs` variable and `rhs` variable in `axis` dimension, and return the result
    * Variable.
    * @param lhs The left input variable.
    * @param rhs The right input variable.
@@ -283,9 +289,7 @@ class NetBuilder {
    */
   Variable Clip(const std::vector<Variable>& x, const float& max, const float& min);
 
-  Variable Gather(const Variable& x, const Variable& index, const int& axis = 0);
-
-  Variable GatherNd(const Variable& x, const Variable& index, const cinn::utils::ShapeType& axes = {});
+  Variable GatherNd(const Variable& x, const Variable& index);
 
   Variable Scatter(const Variable& src, const Variable& index, const Variable& out, const int& axis = 0);
   Variable Scatter(const Variable& src,
@@ -377,14 +381,21 @@ class NetBuilder {
 
     // flatten n-dims vector to 1-dim vector
     auto all_datas = cinn::utils::Flatten(value);
+    CHECK(!all_datas.empty()) << "The value of Constant should not be None or empty list! Please check.";
 
     VLOG(4) << "Constant with values: " << cinn::utils::Join(all_datas, ", ");
 
     using TYPE      = typename decltype(all_datas)::value_type;
     auto true_dtype = dtype.empty() ? common::Type2Str(common::type_of<TYPE>()) : dtype;
-    auto assign_out = CustomInstr("assign_value", {}, {{"values", all_datas}, {"dtype", true_dtype}}).front();
 
-    auto out = Reshape(assign_out, GetVectorShape(value));
+    const auto& real_shape = GetVectorShape(value);
+
+    if (real_shape == std::vector<int>{1}) {
+      return Constant<TYPE>(all_datas[0], name, true_dtype);
+    }
+
+    auto assign_out = CustomInstr("assign_value", {}, {{"values", all_datas}, {"dtype", true_dtype}}).front();
+    auto out        = Reshape(assign_out, real_shape);
 
     // set the name correctly
     out.set_id(name);
@@ -445,7 +456,8 @@ class NetBuilder {
    * `x_num_col_dims` for more details. Default is 1.
    * @return The result variable.
    */
-  Variable Mul(const Variable& x, const Variable& y, int x_num_col_dims = 1, int y_num_col_dims = 1);
+  Variable Mul(
+      const Variable& x, const Variable& y, int x_num_col_dims = 1, int y_num_col_dims = 1, bool is_infer = false);
 
   /**
    * @brief Applies matrix multiplication to two variable. Matmul follows the complete broadcast rules, and its behavior
@@ -496,6 +508,48 @@ class NetBuilder {
                   const std::string& data_format       = "NCHW",
                   bool adaptive                        = false,
                   const std::string& padding_algorithm = "EXPLICIT");
+
+  /**
+   * @brief This operation calculates the pooling output based on the input, pooling_type and pool_size, pool_stride,
+   * pool_padding parameters.
+   * @param x The input variable of pooling operator which is a 4-D variable with shape [N, C, H, W]. The format of
+   * input variable is “NCHW” or “NHWC”, where N is batch size, C is the number of channels, H is the height of the
+   * feature, and W is the width of the feature.
+   * @param y The output variable of pooling operator.
+   * @param dy The gradient variable of pooling operator's otuput.
+   * @param pooling_type pooling type, can be “max” for max-pooling and “avg” for average-pooling
+   * @param ksize The pool kernel size. If pool kernel size is a tuple or list, it must contain two integers,
+   * (pool_size_Height, pool_size_Width). Otherwise, the pool kernel size will be a square of an int.
+   * @param strides  The pool stride size. If pool stride size is a tuple or list, it must contain two integers,
+   * (pool_stride_Height, pool_stride_Width). Otherwise, the pool stride size will be a square of an int. Default is {1,
+   * 1}.
+   * @param paddings he padding size. If padding is a list/tuple, it must contain two integers, (padding_H, padding_W).
+   * Otherwise, the padding_H = padding_W = padding. Default: padding = {0, 0}.
+   * @param ceil_mode Whether to use the ceil function to calculate output height and width. False is the default. If it
+   * is set to False, the floor function will be used. Default False
+   * @param exclusive Whether to exclude padding points in average pooling mode, default is true.
+   * @param global_pooling Whether to use the global pooling. If global_pooling = true, kernel size and paddings will be
+   * ignored. Default False
+   * @param data_format Data format that specifies the layout of input. It can be "NCHW" or "NHWC". Default: "NCHW".
+   * @param adaptive When true, will perform adaptive pooling instead, output shape in H and W dimensions will be same
+   * as ksize, input data will be divided into grids specify by ksize averagely and perform pooling in each grid area to
+   * get output pooling value. Default: False.
+   * @param padding_algorithm CINN not support! It can be "EXPLICIT"/"SAME"/"VALID". Default: "EXPLICIT".
+   * @return The gradient variable of pooling input "X". The data type is same as input variable.
+   */
+  Variable Pool2dGrad(const Variable& x,
+                      const Variable& y,
+                      const Variable& dy,
+                      const std::string& pooling_type,
+                      const std::vector<int>& ksize,
+                      const std::vector<int>& strides      = {1, 1},
+                      const std::vector<int>& paddings     = {0, 0},
+                      bool ceil_mode                       = false,
+                      bool exclusive                       = true,
+                      bool global_pooling                  = false,
+                      const std::string& data_format       = "NCHW",
+                      bool adaptive                        = false,
+                      const std::string& padding_algorithm = "EXPLICIT");
 
   /**
    * @brief Repeat elements of an array `repeats` times along axis `axis`
@@ -571,7 +625,7 @@ class NetBuilder {
    * `axes=axes+rank(input)`.
    * @return Output squeezed variable. Data type is same as input variable.
    */
-  Variable Squeeze(const Variable& x, const cinn::utils::ShapeType& axes);
+  Variable Squeeze(const Variable& x, const cinn::utils::ShapeType& axes = {});
 
   /**
    * @brief Creates an operation to insert new dimensions of length 1.
@@ -580,7 +634,7 @@ class NetBuilder {
    * @param num_newaxis The number of new dimensions to insert
    * @return A variable whose op member is the dim expandsion operation.
    */
-  Variable ExpandDims(const Variable& operand, int axis, int num_newaxis = 1);
+  Variable ExpandDims(const Variable& operand, const cinn::utils::ShapeType& axes);
 
   /**
    * @brief This operator reverse the input along the axis.
@@ -611,10 +665,11 @@ class NetBuilder {
    */
   Variable Slice(const Variable& x,
                  const cinn::utils::ShapeType& axes,
-                 const std::vector<int>& starts      = {},
-                 const std::vector<int>& ends        = {},
-                 const std::vector<int>& infer_flags = {},
-                 const std::vector<int>& strides     = {});
+                 const std::vector<int>& starts        = {},
+                 const std::vector<int>& ends          = {},
+                 const std::vector<int>& infer_flags   = {},
+                 const std::vector<int>& strides       = {},
+                 const std::vector<int>& decrease_axis = {});
 
   /**
    * @brief Returns a new variable which indexes the input variable along dimension axis using the entries in index
@@ -625,7 +680,7 @@ class NetBuilder {
    * @param axis  The dimension in which we index. Default: 0.
    * @return A variable with same data type as x.
    */
-  Variable IndexSelect(const Variable& x, const Variable& index, int axis = 0);
+  Variable Gather(const Variable& x, const Variable& index, int axis = 0);
 
   /**
    * @brief Output is obtained by updating the input on selected indices based on updates.
@@ -689,7 +744,10 @@ class NetBuilder {
    * An optional string from: "AnyLayout", "NHWC", "NCHW". Default: "AnyLayout".
    * @return Output of softmax. The data type and shape are the same as input .
    */
-  Variable Softmax(const Variable& x, int axis = -1, const std::string& data_format = "AnyLayout");
+  Variable Softmax(const Variable& x,
+                   const std::vector<int>& axes   = {-1},
+                   const std::string& mode        = "fast",
+                   const std::string& data_format = "AnyLayout");
 
   // *******************************************
   // Type converter Operator
@@ -945,6 +1003,67 @@ class NetBuilder {
    * @return `The concatenated variable of selected values`.
    */
   Variable LookupTable(const Variable& table, const Variable& ids, int64_t padding_idx);
+
+  /**
+   * @brief Gaussian random
+   * @param shape Shape of the variable to be created.
+   * @param mean Mean of the output variable, default is 0.0f.
+   * @param std Standard deviation of the output variable, default is 1.0f.
+   * @param seed Random seed of generator, default is 0.
+   * @param dtype Data type of output variable, supported data types: float32, float64.
+   */
+  Variable GaussianRandom(const std::vector<int>& shape,
+                          float mean               = 0.0f,
+                          float std                = 1.0f,
+                          int seed                 = 0,
+                          const std::string& dtype = "float32");
+
+  /**
+   * @brief Uniform random
+   * @param shape Shape of the variable to be created.
+   * @param min The lower bound of the range of random values ​​generated, min is included in the range.
+   * @param max The upper bound of the range of random values ​​generated, max is not included in the range.
+   * @param seed Random seed of generator, default is 0.
+   * @param dtype Data tpye of output variable, supported data types: float32, float64.
+   */
+  Variable UniformRandom(const std::vector<int>& shape,
+                         float min                = -1.0f,
+                         float max                = 1.0f,
+                         int seed                 = 0,
+                         const std::string& dtype = "float32");
+
+  /**
+   * @brief Compute cholesky decomposition of a positive definite symmetric matrix.
+   * @param x Positive definite symmetric matrix.
+   * @param upper When upper is true, calculate and return the upper triangular matrix.
+                  When upper is false, calculate and return the lower triangular matrix.
+   * @return Triangular matrix, shape is same as input.
+   */
+  Variable Cholesky(const Variable& x, bool upper = false);
+
+  /**
+   * @brief l2-Norm
+   * @param x The input operand to be normed.
+   * @param axis The axis on which to apply normalization.
+   * @param epsilon The epsilon value is used to avoid division by zero.
+   */
+  Variable Norm(const Variable& x, int axis = -1, float epsilon = 1e-12f);
+
+  /**
+   * @brief Return values and indices of the k largest or smallest at the optional axis.
+   * If the input is a 1-D Tensor, finds the k largest or smallest values and indices.
+   * If the input is a Tensor with higher rank, this operator computes the top k values
+   * and indices along the axis.
+   * @param x Input tensor.
+   * @param k The number of top elements to look for along the axis.
+   * @param axis Axis to compute indices along. The effective range is [-R, R), where R is
+   * x.ndim. when axis < 0, it works the same way as axis + R. Default is -1.
+   * @param largest largest is a flag, if set to true, algorithm will sort by descending
+   * order, otherwise sort by ascending order. Default is True.
+   * @return The values and indices. The value data type is the same as the input x. The
+   * indices data type is int64.
+   */
+  std::vector<Variable> TopK(const Variable& x, int k, int axis, bool largest);
 
  private:
   CINN_DISALLOW_COPY_AND_ASSIGN(NetBuilder);

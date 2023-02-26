@@ -69,6 +69,8 @@ std::string Type2StrForReduce(common::Type type) {
     return "_fp32";
   } else if (type.is_float(16)) {
     return "_fp16";
+  } else if (type.is_float(64)) {
+    return "_fp64";
   } else if (type.is_bool()) {
     return "";
   }
@@ -258,7 +260,7 @@ std::vector<Tensor> WarpReduce(const ir::Tensor& A,
         tmp_indexs.push_back(Expr(0));
         return tmp_out(tmp_indexs);
       },
-      UniqName(output_name));
+      output_name);
 
   return {out, tmp_out};
 }
@@ -343,7 +345,7 @@ std::vector<ir::Tensor> BlockReduceInternal(const ir::Tensor& A,
         tmp_indexs.push_back(Expr(0));
         return tmp_out(tmp_indexs);
       },
-      UniqName(output_name));
+      output_name);
   return {out, tmp_out};
 }
 
@@ -450,7 +452,7 @@ std::vector<ir::Tensor> BlockReduce(const ir::Tensor& A,
         tmp_indexs.push_back(Expr(0));
         return tmp_out(tmp_indexs);
       },
-      UniqName(output_name));
+      output_name);
 
   return {out, tmp_out};
 }
@@ -623,7 +625,7 @@ ir::Tensor BlockShuffleReduce(const ir::Tensor& A,
       [=](const std::vector<Expr>& indexs) -> Expr {
         return lang::CallExtern(reduce_type, {A, A->shape.back(), Expr(stride)});
       },
-      UniqName(output_name));
+      output_name);
   return out;
 }
 

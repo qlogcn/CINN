@@ -13,55 +13,38 @@
 // limitations under the License.
 
 #include "cinn/common/type.h"
-#include "cinn/hlir/pass/fusion_helper_base.h"
+#include "cinn/hlir/framework/pass.h"
+#include "cinn/hlir/op/external_api_registry.h"
+#include "cinn/utils/string.h"
+
+DECLARE_string(cinn_custom_call_deny_ops);
+
 namespace cinn {
 namespace hlir {
 namespace pass {
 
+using cinn::hlir::op::ExternalApiRegistry;
 using framework::Graph;
 using framework::Node;
 using framework::NodeData;
-using framework::OpPatternKind;
-using framework::shape_t;
-
-using common::GraphEdge;
-using common::GraphNode;
-
-using GroupPtr  = std::shared_ptr<Graph::Group>;
-using GroupList = std::vector<GroupPtr>;
-
-using ShapeDict         = absl::flat_hash_map<std::string, shape_t>;
-using ConditionFunction = std::function<bool(const Node*, const Node*)>;
 
 class GraphAlterHelper {
  public:
-  GraphAlterHelper(Graph* graph) : graph_(graph) {}
-  void MatmulToCublasCustomCall() {
-    auto nodes = graph_->CollectNodes([](const common::GraphNode* graph_node) -> bool {
-      if (graph_node->safe_as<Node>()) {
-        auto node = graph_node->safe_as<Node>();
-        if (node->op()->name == "matmul" || node->op()->name == "mul" || node->op()->name == "cublas_gemm" ||
-            node->op()->name == "cublas_matmul") {
-          return true;
-        }
-      }
-
-      return false;
-    });
-
-    for (auto gnode : nodes) {
-      auto src = gnode->safe_as<Node>();
-      CHECK(src);
-      src->attrs.op                        = framework::Operator::Get("custom_call");
-      src->attrs.attr_store["custom_call"] = std::string("cinn_call_cublas");
+  GraphAlterHelper(Graph* graph) : graph_(graph) {
+    if (!FLAGS_cinn_custom_call_deny_ops.empty()) {
+      auto splited_names = cinn::utils::Split(FLAGS_cinn_custom_call_deny_ops, ";");
+      deny_ops_          = {splited_names.begin(), splited_names.end()};
     }
   }
-
-  void ConvToCudnnCustomCall() {
-    auto nodes = graph_->CollectNodes([](const common::GraphNode* graph_node) -> bool {
+  void TransToCustomCall(const common::Target& target) {
+    // collect candidate nodes
+    auto mark_nodes = graph_->CollectNodes([this, &target](const common::GraphNode* graph_node) -> bool {
       if (graph_node->safe_as<Node>()) {
-        auto node = graph_node->safe_as<Node>();
-        if (node->op()->name == "conv2d") {
+        auto node      = graph_node->safe_as<Node>();
+        auto&& op_name = node->op()->name;
+        // a op with external_api registered and not excluded explicitly will be selected
+        if (!IsExcluded(op_name) && ExternalApiRegistry::Global()->Has(op_name, target)) {
+          VLOG(4) << "Op:" << op_name << " will not use custom_call";
           return true;
         }
       }
@@ -69,65 +52,48 @@ class GraphAlterHelper {
       return false;
     });
 
-    for (auto gnode : nodes) {
-      auto src = gnode->safe_as<Node>();
-      CHECK(src);
-      src->attrs.op = framework::Operator::Get("custom_call");
-      CHECK(src->attrs.attr_store.count("conv_type"));
-      std::string type = src->attrs.attr_store.count("conv_type")
-                             ? absl::get<std::string>(src->attrs.attr_store["conv_type"])
-                             : "forward";
-      if (type == "forward") {
-        src->attrs.attr_store["custom_call"] = std::string("cinn_call_cudnn_conv2d_forward");
-      } else if (type == "backward_data") {
-        src->attrs.attr_store["custom_call"] = std::string("cinn_call_cudnn_conv2d_backward_data");
-      } else if (type == "backward_filter") {
-        src->attrs.attr_store["custom_call"] = std::string("cinn_call_cudnn_conv2d_backward_filter");
-      } else {
-        LOG(FATAL) << "conv type is unkown!";
+    for (auto* graph_node : mark_nodes) {
+      auto* node = graph_node->safe_as<Node>();
+      // revise the output edges for conv2d because the compute implement of
+      // codegen-registered is not consistent with cudnn
+      if (node->op()->name == "conv2d" && target == common::DefaultNVGPUTarget()) {
+        auto out_links = node->outlinks_in_order(true);
+        for (int idx = 1; idx < out_links.size(); ++idx) {
+          auto link = out_links[idx];
+          CHECK(link->sink()->safe_as<NodeData>());
+          node->UnLinkSingleTo(link->sink());
+          graph_->DropNode(link->sink());
+        }
       }
-      auto out_links = src->outlinks_in_order(true);
-      for (int idx = 1; idx < out_links.size(); ++idx) {
-        auto link = out_links[idx];
-        CHECK(link->sink()->safe_as<NodeData>());
-        src->UnLinkSingleTo(link->sink());
-        graph_->DropNode(link->sink());
-      }
+
+      node->attrs.attr_store["original_op"] = node->op()->name;
+      node->attrs.op                        = framework::Operator::Get("custom_call");
     }
   }
 
  private:
   Graph* graph_;
+  std::unordered_set<std::string> deny_ops_;
+
+  bool IsExcluded(const std::string& op_name) { return deny_ops_.count(op_name); }
 };
 
-void MatmulToCublasCustomCallPassInternal(Graph* graph) {
-  VLOG(3) << "MatmulToCublasCustomCallPass...!";
-  GraphAlterHelper(graph).MatmulToCublasCustomCall();
-  VLOG(3) << "MatmulToCublasCustomCallPass Finish...!";
-}
-
-void ConvToCudnnCustomCallPassInternal(Graph* graph) {
-  VLOG(3) << "ConvToCudnnCustomCallPass...!";
-  GraphAlterHelper(graph).ConvToCudnnCustomCall();
-  VLOG(3) << "ConvToCudnnCustomCallPass Finish...!";
+void TransToCustomCallInternal(Graph* graph) {
+  VLOG(3) << "TransToCustomCallPass...!";
+  GraphAlterHelper(graph).TransToCustomCall(graph->target_);
+  VLOG(3) << "TransToCustomCallPass Finish...!";
 }
 
 }  // namespace pass
 }  // namespace hlir
 }  // namespace cinn
 
-CINN_REGISTER_HELPER(CustomCallPass) {
-#ifdef CINN_WITH_CUDA
-  CINN_REGISTER_PASS(MatmulToCublasCustomCallPass)
-      .describe("This pass which convert matmul op to custom call pass.")
+CINN_REGISTER_HELPER(TransToCustomCallPass) {
+  CINN_REGISTER_PASS(TransToCustomCallPass)
+      .describe(
+          "This pass replaces every op with external_api registered on the specified target to be custom_call op, "
+          "except the blacklist specified by FLAGS_cinn_custom_call_deny_ops")
       .set_change_structure(false)
-      .set_body(cinn::hlir::pass::MatmulToCublasCustomCallPassInternal);
-#endif
-#ifdef CINN_WITH_CUDNN
-  CINN_REGISTER_PASS(ConvToCudnnCustomCallPass)
-      .describe("This pass which convert conv op to custom call pass.")
-      .set_change_structure(false)
-      .set_body(cinn::hlir::pass::ConvToCudnnCustomCallPassInternal);
-#endif
+      .set_body(cinn::hlir::pass::TransToCustomCallInternal);
   return true;
 }

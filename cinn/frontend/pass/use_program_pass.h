@@ -16,6 +16,7 @@
 
 #include "cinn/common/macros.h"
 
+CINN_USE_REGISTER(AutoCast)
 CINN_USE_REGISTER(Decomposer)
 CINN_USE_REGISTER(DeadCodeEliminate)
 CINN_USE_REGISTER(RemoveIdentity)
@@ -25,3 +26,4 @@ CINN_USE_REGISTER(GemmRewriter)
 CINN_USE_REGISTER(TransposeFoldingOutput)
 CINN_USE_REGISTER(FillConstantRewriter)
 CINN_USE_REGISTER(FillConstantFolding)
+CINN_USE_REGISTER(CastCollapsing)

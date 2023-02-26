@@ -59,6 +59,11 @@ void LayerNormOpMapper(const paddle::cpp::OpDesc& op_desc, const OpMapperContext
     bias = ctx.GetVar(*bias_name);
   }
 
+  VLOG(4) << "layer_norm X=" << x_name << "[" << cinn::utils::Join(x->shape, ",") << "], Scale=" << scale_name.value()
+          << "[" << cinn::utils::Join(scale.value()->shape, ",") << "], Bias=" << bias_name.value() << "["
+          << cinn::utils::Join(bias.value()->shape, ",") << "], epsilon=" << epsilon
+          << ", begin_norm_axis=" << begin_norm_axis;
+
   const auto& x_shape = x->shape;
   auto x_ndim         = x_shape.size();
   CHECK_LT(begin_norm_axis, x_ndim) << "`begin_norm_axis` must be less than the dimensions of X, but received "
@@ -76,6 +81,12 @@ void LayerNormOpMapper(const paddle::cpp::OpDesc& op_desc, const OpMapperContext
 
   // compute mean
   auto* builder = ctx.Builder();
+
+  const auto& x_type = x->type;
+  if (x_type.is_float(16)) {
+    x = builder->Cast(x, "float32");
+  }
+
   std::vector<int> shape{left, right};
   auto x_reshape = builder->Reshape(x, shape);
   auto x_reduce  = builder->ReduceSum(x_reshape, {1});
@@ -99,6 +110,10 @@ void LayerNormOpMapper(const paddle::cpp::OpDesc& op_desc, const OpMapperContext
   auto x_var_eps  = builder->Add(x_var, epsilon_var);
   auto x_var_sqrt = builder->Sqrt(x_var_eps);
   auto y_out      = builder->Divide(y_sub, builder->BroadcastTo(x_var_sqrt, shape, {0}));
+
+  if (x_type.is_float(16)) {
+    y_out = builder->Cast(y_out, "float16");
+  }
 
   // multiply scale
   if (scale) {

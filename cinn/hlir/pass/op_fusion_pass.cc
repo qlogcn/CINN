@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cinn/hlir/pass/op_fusion_pass.h"
-
 #include "cinn/common/type.h"
-#include "cinn/hlir/pass/fusion_helper_base.h"
+#include "cinn/hlir/pass/op_fusion_pass_util.h"
+
 namespace cinn {
 namespace hlir {
 namespace pass {
@@ -32,8 +31,7 @@ using common::GraphNode;
 using GroupPtr  = std::shared_ptr<Graph::Group>;
 using GroupList = std::vector<GroupPtr>;
 
-using ShapeDict         = absl::flat_hash_map<std::string, shape_t>;
-using ConditionFunction = std::function<bool(const Node*, const Node*)>;
+using ConditionFunction = std::function<bool(const FusionHelperBase*, const Node*, const GroupPtr&)>;
 
 // Op Fusion Pass which performs Ops fusion, Ops are fused
 // "vertically", meaning producing Ops are fused into their consumers
@@ -184,8 +182,10 @@ class OpFusionPassHelper : public FusionHelperBase {
         }
 
         if (this->output_nodes_set_.count(producer)) {
+          VLOG(3) << "Insert Global Output Node : " << producer->id();
           consumer_fusion->output_nodes.insert(producer);
-        } else if (producer_data->outlinks().size() > 1 && producer->inlinks().size() > 0) {
+        } else if (producer_data->outlinks().size() > 1 && producer->inlinks().size() > 0 &&
+                   is_same_size(this, producer, consumer_fusion)) {
           // producer is not a const value node.
           consumer_fusion->internal_nodes.insert(producer);
         }
@@ -207,141 +207,6 @@ class OpFusionPassHelper : public FusionHelperBase {
   }
 
   void InitFusionRelation() {
-    // fusion op fuse condition function.
-    // 1. always can fuse.
-    auto always_fuse = [](const Node* producer, const Node* consumer) -> bool { return true; };
-    // 2. cant fuse.
-    auto no_fuse = [](const Node* producer, const Node* consumer) -> bool { return false; };
-    // 3. has same output shape.
-    auto is_same_shape = [this](const Node* producer, const Node* consumer) -> bool {
-      auto& fusion_op  = this->fusion_groups_[consumer];
-      auto master_node = fusion_op->master_nodes.begin();
-      return this->GetNodeDataShape(producer) == this->GetNodeDataShape(*master_node) ? true : false;
-    };
-    // 4. without last dimension in reduce axis.
-    auto without_last_dimension_in_reduce = [this](const Node* producer, const Node* consumer) -> bool {
-      auto in_shape    = this->shape_dict_.at(producer->inlinks_in_order()[0]->source()->id());
-      auto reduce_axes = absl::get<std::vector<int>>(producer->attrs.attr_store.at("dim"));
-      return this->WithoutLastDimInReduce(in_shape, reduce_axes);
-    };
-    // 5. checkout reduce op has same attr.
-    auto reduce_fuse_reduce = [this](const Node* producer, const Node* consumer) -> bool {
-      auto& fusion_op = this->fusion_groups_[consumer];
-      Node* reducer   = NULL;
-      for (auto* master : fusion_op->master_nodes) {
-        if (this->GetOpKind(master) == framework::kReduction) {
-          reducer = master;
-          break;
-        }
-      }
-      // check reduce has same input shape and output shape
-      auto producer_input_shape  = shape_dict_.at(producer->inlinks_in_order()[0]->source()->id());
-      auto producer_output_shape = shape_dict_.at(producer->outlinks_in_order()[0]->sink()->id());
-
-      auto reducer_input_shape  = shape_dict_.at(reducer->inlinks_in_order()[0]->source()->id());
-      auto reducer_output_shape = shape_dict_.at(reducer->outlinks_in_order()[0]->sink()->id());
-
-      auto producer_reduce_dim = absl::get<std::vector<int>>(producer->attrs.attr_store.at("dim"));
-      auto reducer_reduce_dim  = absl::get<std::vector<int>>(reducer->attrs.attr_store.at("dim"));
-
-      for (auto& dim : producer_reduce_dim) {
-        // if dim = -1, set as shape.size() - 1
-        if (dim == -1) {
-          dim = producer_input_shape.size() - 1;
-        }
-      }
-
-      for (auto& dim : reducer_reduce_dim) {
-        // if dim = -1,  set as shape.size() - 1
-        if (dim == -1) {
-          dim = reducer_input_shape.size() - 1;
-        }
-      }
-
-      // check shape is same
-      if (producer_input_shape == reducer_input_shape && producer_output_shape == reducer_output_shape &&
-          producer_reduce_dim == reducer_reduce_dim) {
-        auto shared_size = GetSharedSize(producer);
-        for (auto* master : fusion_op->master_nodes) {
-          if (this->GetOpKind(master) == framework::kReduction) {
-            shared_size += GetSharedSize(master);
-          }
-        }
-
-#define MAX_AVAILABLE_SHREAD 32 * 1024
-        if (shared_size > MAX_AVAILABLE_SHREAD) {
-          return false;
-        }
-#undef MAX_AVAILABLE_SHREAD
-        return true;
-      }
-
-      if (this->WithoutLastDimInReduce(producer_input_shape, producer_reduce_dim) &&
-          this->WithoutLastDimInReduce(reducer_input_shape, reducer_reduce_dim) &&
-          producer_output_shape == reducer_output_shape && producer_reduce_dim == reducer_reduce_dim) {
-        auto shared_size = GetSharedSize(producer);
-        for (auto* master : fusion_op->master_nodes) {
-          if (this->GetOpKind(master) == framework::kReduction) {
-            shared_size += GetSharedSize(master);
-          }
-        }
-
-#define MAX_AVAILABLE_SHREAD 32 * 1024
-        if (shared_size > MAX_AVAILABLE_SHREAD) {
-          return false;
-        }
-#undef MAX_AVAILABLE_SHREAD
-        return true;
-      }
-
-      return false;
-    };
-    // 6.check with same shape or with last successive reduce is less than max threads
-    auto is_same_shape_or_vertical_reduce_relation = [this, is_same_shape](const Node* producer,
-                                                                           const Node* consumer) -> bool {
-      // check is same shape with horizontal relation.
-      if (is_same_shape(producer, consumer)) {
-        return true;
-      }
-
-      // reducer node in fusion op.
-      auto& fusion_op = this->fusion_groups_[consumer];
-      Node* reducer   = NULL;
-      for (auto* master : fusion_op->master_nodes) {
-        if (this->GetOpKind(master) == framework::kReduction) {
-          reducer = master;
-          break;
-        }
-      }
-
-      // check producer has same shape with reducer node.
-      auto reduce_shape = shape_dict_.at(GetProducerNodeData(reducer)[0]->id());
-      auto reduce_axes  = absl::get<std::vector<int>>(reducer->attrs.attr_store.at("dim"));
-      for (auto& axis : reduce_axes) {
-        // if axis = -1, set as shape.size() - 1
-        if (axis == -1) {
-          axis = reduce_shape.size() - 1;
-        }
-      }
-      // check without last axis in reduce.
-      if (GetNodeDataShape(producer) != reduce_shape || WithoutLastDimInReduce(reduce_shape, reduce_axes)) {
-        return false;
-      }
-
-      int succesive_reduce_dimension = reduce_shape.at(reduce_axes.back());
-      for (int idx = reduce_axes.size() - 2; idx >= 0; --idx) {
-        if (reduce_axes[idx] == reduce_axes[idx + 1] - 1) {
-          succesive_reduce_dimension *= reduce_shape[reduce_axes[idx]];
-          continue;
-        }
-        break;
-      }
-
-      return this->target_ == common::DefaultNVGPUTarget()
-                 ? (succesive_reduce_dimension <= this->target_.max_num_threads() ? true : false)
-                 : true;
-    };
-
     // fusion relation.
     // 1.kElementwise as producer
     {
@@ -354,11 +219,12 @@ class OpFusionPassHelper : public FusionHelperBase {
           {framework::kElementWise, always_fuse},
           // must be horizontal, as Elementwise + Broadcast is left to fusion merge pass.
           {framework::kBroadcast,
-           [this, is_same_shape](const Node* producer, const Node* consumer) -> bool {
-             if (is_same_shape(producer, consumer)) {
+           [](const FusionHelperBase* helper, const Node* producer, const GroupPtr& consumer) -> bool {
+             if (is_same_size(helper, producer, consumer)) {
                return true;
              }
-             if (producer->op()->name == "const_scalar" && consumer->op()->name == "broadcast_to") {
+
+             if (helper->IsConstOp(producer) && !helper->output_nodes_set_.count(producer)) {
                return true;
              }
 
@@ -366,13 +232,9 @@ class OpFusionPassHelper : public FusionHelperBase {
            }},
           // horizontal or vertical relation, check with same output shape with horizontal relation or with last
           // successive dimension less than 1024 for gpu.
-          {framework::kReduction, is_same_shape_or_vertical_reduce_relation},
+          {framework::kReduction, horizontal_or_vertical_reduce_relation},
           // can be horizontal or can compute inline, check with same output shape or can compute inline.
-          {framework::kInjective,
-           [this, is_same_shape](const Node* producer, const Node* consumer) -> bool {
-             return is_same_shape(producer, consumer) || (this->GetNodeData(producer)->outlinks().size() == 1 &&
-                                                          !this->output_nodes_set_.count(const_cast<Node*>(producer)));
-           }},
+          {framework::kInjective, horizontal_or_can_inline},
           // must be horizontal, check with same output shape.
           {framework::kOutFusible, is_same_shape}};
       fusion_relation_map_[framework::kElementWise] = std::move(relation);
@@ -385,17 +247,13 @@ class OpFusionPassHelper : public FusionHelperBase {
       // producer -> fusion
       relation.fusion_op_kind = {
           // horizontal or vertical relation(Broadcast + *Elementwise*), check with same output shape.
-          {framework::kElementWise, is_same_shape},
+          {framework::kElementWise, is_same_size},
           // must be horizontal, as Broadcast + Broadcast is not allowed.
-          {framework::kBroadcast, is_same_shape},
+          {framework::kBroadcast, is_same_size},
           // horizontal or vertical relation(Broadcast + Reduce).
-          {framework::kReduction, always_fuse},
+          {framework::kReduction, horizontal_or_vertical_reduce_relation},
           // can be horizontal or can compute inline, check with same output shape or just one consumer.
-          {framework::kInjective,
-           [this, is_same_shape](const Node* producer, const Node* consumer) -> bool {
-             return is_same_shape(producer, consumer) || (this->GetNodeData(producer)->outlinks().size() == 1 &&
-                                                          !this->output_nodes_set_.count(const_cast<Node*>(producer)));
-           }},
+          {framework::kInjective, horizontal_or_can_inline},
           // must be horizontal, check with same output shape.
           {framework::kOutFusible, is_same_shape}};
       fusion_relation_map_[framework::kBroadcast] = std::move(relation);
@@ -411,12 +269,13 @@ class OpFusionPassHelper : public FusionHelperBase {
           {framework::kElementWise, without_last_dimension_in_reduce},
           // must be horizontal relation, check with same output shape and without last dimension in reduce.
           {framework::kBroadcast,
-           [this, is_same_shape, without_last_dimension_in_reduce](const Node* producer, const Node* consumer) -> bool {
-             return is_same_shape(producer, consumer) && without_last_dimension_in_reduce(producer, consumer);
+           [](const FusionHelperBase* helper, const Node* producer, const GroupPtr& consumer) -> bool {
+             return is_same_size(helper, producer, consumer) &&
+                    without_last_dimension_in_reduce(helper, producer, consumer);
            }},
           // must be horizontal relation and with same reduce attr.
           {framework::kReduction, reduce_fuse_reduce},
-          // can't fuse.
+          // no_fuse
           {framework::kInjective, no_fuse},
           // can't fuse.
           {framework::kOutFusible, no_fuse}};
@@ -426,17 +285,17 @@ class OpFusionPassHelper : public FusionHelperBase {
     {
       FusionRelation relation;
       // producer -> consumer
-      relation.op_kind = {framework::kElementWise, framework::kReduction};
+      relation.op_kind = {framework::kElementWise, framework::kInjective};
       // producer -> fusion
       relation.fusion_op_kind = {
           // can be horizontal or vertical(Injective + Elementwise), check with same output shape.
-          {framework::kElementWise, is_same_shape},
+          {framework::kElementWise, is_same_size},
           // must be horizontal relation, check with same output shape.
-          {framework::kBroadcast, is_same_shape},
+          {framework::kBroadcast, horizontal_with_same_size},
           // left to fusion merge pass.
           {framework::kReduction, no_fuse},
           // must be horizontal relation, check with same output shape.
-          {framework::kInjective, is_same_shape},
+          {framework::kInjective, horizontal_or_can_inline},
           // can't fuse.
           {framework::kOutFusible, no_fuse},
       };
@@ -470,7 +329,9 @@ class OpFusionPassHelper : public FusionHelperBase {
     if (relation.op_kind.count(GetOpKind(consumer))) {
       auto& consumer_group = fusion_groups_[consumer];
       // second step: check producer can be fused into consumer group
-      return relation.fusion_op_kind[consumer_group->op_pattern_kind](producer, consumer);
+      VLOG(3) << "Call ConditionFunction, Producer Op Pattern : " << GetOpKind(producer)
+              << " , Consumer Group Pattern : " << consumer_group->op_pattern_kind;
+      return relation.fusion_op_kind[consumer_group->op_pattern_kind](this, producer, fusion_groups_[consumer]);
     }
 
     return false;
@@ -538,10 +399,12 @@ void InsertBroadcastTo(Graph* graph) {
               axis = absl::get<int>(node->attrs.attr_store["axis"]);
             }
             if (axis == -1) {
-              axis = output_shape.size() - 1;
+              axis = output_shape.size() - input_shape.size();
             }
             node->attrs.attr_store = {};
-            CHECK_LE(axis + input_shape.size(), output_shape.size());
+            CHECK_LE(axis + input_shape.size(), output_shape.size())
+                << "The rank of input " << input_data->id() << " + axis " << axis
+                << " should less equal rank of output " << node_data->id();
             for (int idx = 0; idx < input_shape.size(); ++idx) {
               broadcast_axes.push_back(axis++);
             }
@@ -586,10 +449,10 @@ void OpFusionPassInternal(Graph* graph) {
   VLOG(3) << "OpFusionPass Finish...!";
 }
 
-std::vector<std::shared_ptr<framework::Graph::Group>> BuildNonFusedGroups(const framework::Graph* graph) {
+void BuildNonFusedGroupsPassInternal(framework::Graph* graph) {
   auto op_fusion_helper = OpFusionPassHelper(graph);
   VLOG(3) << "Apply OpFusionPass to generate initial non-fusion groups";
-  return op_fusion_helper(false);
+  graph->fusion_groups = op_fusion_helper(false);
 }
 
 }  // namespace pass
@@ -602,6 +465,11 @@ CINN_REGISTER_HELPER(OpFusionPass) {
           "Op Fusion Pass which performs Ops fusion, Producer Ops are fused into Consumer Ops with certain conditions.")
       .set_change_structure(false)
       .set_body(cinn::hlir::pass::OpFusionPassInternal);
+
+  CINN_REGISTER_PASS(BuildNonFusedGroupsPass)
+      .describe("Build No Fused Groups.")
+      .set_change_structure(false)
+      .set_body(cinn::hlir::pass::BuildNonFusedGroupsPassInternal);
 
   return true;
 }

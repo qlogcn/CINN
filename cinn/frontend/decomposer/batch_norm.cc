@@ -52,12 +52,6 @@ struct BatchNormHelper {
     VLOG(4) << op_type << " is decomposed to " << builder->size() - num_instructions << " instructions.";
   }
 
-  template <typename T>
-  Variable GetTensorFromScalar(T value, std::string name, const std::vector<int>& shape) {
-    // return builder->BroadcastTo(builder->Constant<T>(value, common::UniqName(name)), shape, {0});
-    return builder->FillConstant<T>(shape, value, common::UniqName(name));
-  }
-
   std::vector<Variable> MeanAndVariance(Variable x) {
     auto mean = Mean(x);
     // variance = reduce_sum(x * x) / nhw - mean * mean, shape = [c], simplified by equation: E(x^2) - [E(x)]^2
@@ -76,33 +70,37 @@ struct BatchNormHelper {
 
   // mean = reduce_sum(x) / nhw
   Variable Mean(Variable x) {
-    auto element_count_1d = GetTensorFromScalar<float>(element_count, "element_count", param_shape);
     auto sum              = Reduce(x);
-    auto mean             = builder->Divide(sum, element_count_1d);
+    auto element_count_1d = builder->FillConstant(
+        sum->shape, element_count, common::UniqName("element_count"), common::Type2Str(sum->type));
+    auto mean = builder->Divide(sum, element_count_1d);
     return mean;
   }
 
   // variance = reduce_sum(x * x) / nhw - mean * mean
   Variable Variance(Variable x, Variable mean) {
-    auto element_count_1d = GetTensorFromScalar<float>(element_count, "element_count", param_shape);
     auto x_square         = builder->Multiply(x, builder->Identity(x));
     auto x_square_sum     = Reduce(x_square);
-    auto x_square_mean    = builder->Divide(x_square_sum, element_count_1d);
-    auto variance         = builder->Subtract(x_square_mean, builder->Multiply(mean, builder->Identity(mean)));
+    auto element_count_1d = builder->FillConstant(
+        x_square_sum->shape, element_count, common::UniqName("element_count"), common::Type2Str(x_square_sum->type));
+    auto x_square_mean = builder->Divide(x_square_sum, element_count_1d);
+    auto variance      = builder->Subtract(x_square_mean, builder->Multiply(mean, builder->Identity(mean)));
     return variance;
   }
 
   // std_variance_inv = rsqrt(variance + epsilon)
   Variable StdVarianceInv1d(Variable variance, float epsilon) {
-    auto epsilon_1d       = GetTensorFromScalar<float>(epsilon, "epsilon", param_shape);
+    auto epsilon_1d =
+        builder->FillConstant(variance->shape, epsilon, common::UniqName("epsilon"), common::Type2Str(variance->type));
     auto std_variance_inv = builder->Rsqrt(builder->Add(variance, epsilon_1d));
     return std_variance_inv;
   }
 
   // std_variance_inv = rsqrt(variance + epsilon)
   Variable StdVarianceInv4d(Variable variance, float epsilon) {
-    auto epsilon_4d          = GetTensorFromScalar<float>(epsilon, "epsilon", x_shape);
-    auto variance_4d         = builder->BroadcastTo(variance, x_shape, {channel_dim});
+    auto variance_4d = builder->BroadcastTo(variance, x_shape, {channel_dim});
+    auto epsilon_4d  = builder->FillConstant(
+        variance_4d->shape, epsilon, common::UniqName("epsilon"), common::Type2Str(variance_4d->type));
     auto std_variance_inv_4d = builder->Rsqrt(builder->Add(variance_4d, epsilon_4d));
     return std_variance_inv_4d;
   }
@@ -110,8 +108,10 @@ struct BatchNormHelper {
   // moving_value = moving_value * momentum + (1.0 - momentum) * saved_value
   // value maybe mean and variance.
   Variable UpdateMeanVariance(Variable moving_value, Variable saved_value, float momentum) {
-    auto factor_0 = GetTensorFromScalar<float>(momentum, "factor_0", moving_value->shape);
-    auto factor_1 = GetTensorFromScalar<float>(1.0f - momentum, "factor_1", moving_value->shape);
+    auto factor_0 = builder->FillConstant(
+        moving_value->shape, momentum, common::UniqName("factor_0"), common::Type2Str(moving_value->type));
+    auto factor_1 = builder->FillConstant(
+        saved_value->shape, 1.0f - momentum, common::UniqName("factor_1"), common::Type2Str(saved_value->type));
     auto new_moving_value =
         builder->Add(builder->Multiply(moving_value, factor_0), builder->Multiply(saved_value, factor_1));
     return new_moving_value;
@@ -140,6 +140,9 @@ void batch_norm_train(const Instruction& instr, const DecomposerContext& context
   auto& bias            = instr->inputs[2];
   auto& moving_mean     = instr->inputs[3];
   auto& moving_variance = instr->inputs[4];
+  CHECK_EQ(scale->type, bias->type);
+  CHECK_EQ(scale->type, moving_mean->type);
+  CHECK_EQ(scale->type, moving_variance->type);
 
   float epsilon      = instr.GetAttrs<float>("epsilon");
   float momentum     = instr.GetAttrs<float>("momentum");
@@ -187,6 +190,9 @@ void batch_norm_grad(const Instruction& instr, const DecomposerContext& context)
   auto& scale         = instr->inputs[2];
   auto& save_mean     = instr->inputs[3];
   auto& save_variance = instr->inputs[4];
+  CHECK_EQ(y_grad->type, x->type);
+  CHECK_EQ(scale->type, save_mean->type);
+  CHECK_EQ(scale->type, save_variance->type);
 
   auto epsilon = instr.GetAttrs<float>("epsilon");
   auto layout  = instr.GetAttrs<std::string>("data_layout");
@@ -204,13 +210,17 @@ void batch_norm_grad(const Instruction& instr, const DecomposerContext& context)
   // x_grad = 1/nhw * scale * rsqrt(variance + epsilon) *
   //   (nhw * y_grad - reduce_sum(y_grad) - (x - mean) * reduce_sum(y_grad * (x - mean)) / (variance + epsilon))
   // => x_grad = tmp0 * (tmp1 - tmp2 - tmp3)
-  auto element_count_1d = helper.GetTensorFromScalar<float>(helper.element_count, "element_count_1d", scale->shape);
   auto scaled_std_variance_inv = builder->Multiply(scale, helper.StdVarianceInv1d(save_variance, epsilon));
+  auto element_count_1d        = builder->FillConstant(scaled_std_variance_inv->shape,
+                                                helper.element_count,
+                                                common::UniqName("element_count_1d"),
+                                                common::Type2Str(scaled_std_variance_inv->type));
   auto tmp0 =
       builder->BroadcastTo(builder->Divide(scaled_std_variance_inv, element_count_1d), x->shape, {helper.channel_dim});
 
-  auto element_count_4d = helper.GetTensorFromScalar<float>(helper.element_count, "element_count_4d", x->shape);
-  auto tmp1             = builder->Multiply(y_grad, element_count_4d);
+  auto element_count_4d = builder->FillConstant(
+      y_grad->shape, helper.element_count, common::UniqName("element_count_4d"), common::Type2Str(y_grad->type));
+  auto tmp1 = builder->Multiply(y_grad, element_count_4d);
 
   auto tmp2 = builder->BroadcastTo(bias_grad, x->shape, {helper.channel_dim});
 
@@ -219,8 +229,9 @@ void batch_norm_grad(const Instruction& instr, const DecomposerContext& context)
 
   auto sum_of_y_grad_mul_x_mean_diff_4d =
       builder->BroadcastTo(sum_of_y_grad_mul_x_mean_diff, x->shape, {helper.channel_dim});
-  auto tmp3_0              = builder->Multiply(x_mean_diff, sum_of_y_grad_mul_x_mean_diff_4d);
-  auto epsilon_1d          = helper.GetTensorFromScalar<float>(epsilon, "epsilon", scale->shape);
+  auto tmp3_0     = builder->Multiply(x_mean_diff, sum_of_y_grad_mul_x_mean_diff_4d);
+  auto epsilon_1d = builder->FillConstant(
+      save_variance->shape, epsilon, common::UniqName("epsilon"), common::Type2Str(save_variance->type));
   auto variance_add_eps    = builder->Add(save_variance, epsilon_1d);
   auto variance_add_eps_4d = builder->BroadcastTo(variance_add_eps, x->shape, {helper.channel_dim});
   auto tmp3                = builder->Divide(tmp3_0, variance_add_eps_4d);
@@ -243,6 +254,9 @@ void batch_norm(const Instruction& instr, const DecomposerContext& context) {
   auto& bias            = instr->inputs[2];
   auto& moving_mean     = instr->inputs[3];
   auto& moving_variance = instr->inputs[4];
+  CHECK_EQ(scale->type, bias->type);
+  CHECK_EQ(scale->type, moving_mean->type);
+  CHECK_EQ(scale->type, moving_variance->type);
 
   float epsilon      = instr.GetAttrs<float>("epsilon");
   float momentum     = instr.GetAttrs<float>("momentum");

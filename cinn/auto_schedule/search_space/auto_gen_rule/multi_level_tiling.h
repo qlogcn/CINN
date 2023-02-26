@@ -50,6 +50,10 @@ class MultiLevelTiling : public AutoGenRule {
   // Returns true if sche_block_realize is applicable by MultiLevelTiling
   bool MeetCondition(const ir::ScheduleBlockRealize& sche_block_realize) const;
 
+  RuleApplyType AnalyseApplyType(SearchState state, const std::string& block_name) const override;
+
+  std::vector<SearchState> ApplyOnBlock(SearchState state, const std::string& block_name) override;
+
   // Sample pair of integer type (a, b) such as a * b = extent
   template <typename T>
   std::vector<T> SampleSplitTwo(T extent) const {
@@ -91,6 +95,9 @@ class MultiLevelTiling : public AutoGenRule {
   }
 
  private:
+  void Apply(ir::IRSchedule* ir_schedule, ir::Expr& block_expr);
+
+ private:
   std::vector<ir::Expr> all_block_realizes_;
   std::vector<int> applicable_indices_;
 
@@ -106,7 +113,8 @@ class MultiLevelTiling : public AutoGenRule {
 
   std::vector<std::string> bind_axis_;
 
-  int max_factor = 64;
+  // A factor to limit the split factor within max thread number per block
+  int max_factor_ = 1024;
 };
 
 }  // namespace auto_schedule

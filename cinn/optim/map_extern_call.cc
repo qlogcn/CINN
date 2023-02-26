@@ -22,12 +22,21 @@ namespace cinn {
 namespace optim {
 
 static const std::set<std::string> kExternFp32CallsGPU{
-    {"exp",   "erf",   "sigmoid", "sqrt",  "log",   "log2", "log10",    "floor", "ceil",
-     "round", "trunc", "cos",     "cosh",  "tan",   "sin",  "sinh",     "acos",  "acosh",
-     "asin",  "asinh", "atan",    "atanh", "isnan", "tanh", "isfinite", "isinf", "remainder"}};
+    {"exp",   "erf",  "sigmoid",  "sqrt",  "log",       "log2",  "log10", "floor", "ceil",  "round", "trunc",
+     "cos",   "cosh", "tan",      "sin",   "sinh",      "acos",  "acosh", "asin",  "asinh", "atan",  "atanh",
+     "isnan", "tanh", "isfinite", "isinf", "remainder", "rsqrt", "cbrt",  "abs",   "pow",   "mod"}};
 
-static const std::set<std::string> kExternInt32CallsGPU{
-    {"left_shift", "right_shift", "bitwise_or", "bitwise_and", "bitwise_xor", "bitwise_not"}};
+static const std::set<std::string> kExternInt32CallsGPU{{"left_shift",
+                                                         "right_shift",
+                                                         "bitwise_or",
+                                                         "bitwise_and",
+                                                         "bitwise_xor",
+                                                         "bitwise_not",
+                                                         "pow",
+                                                         "logical_right_shift",
+                                                         "clz",
+                                                         "popc",
+                                                         "mod"}};
 
 static const std::set<std::string> kExternFp32CallsCPU = {
     "erf", "acos", "acosh", "asin", "asinh", "atan", "atanh", "remainder"};
@@ -83,7 +92,9 @@ void MapExternCall(Expr *e, Target target) {
           suffix = "_int64";
         }
       } else if (dtype.is_float() && node_in_extern_fp32) {
-        if (dtype.is_float(32)) {
+        if (dtype.is_float(64)) {
+          suffix = "_fp64";
+        } else if (dtype.is_float(32)) {
           suffix = "_fp32";
         } else if (dtype.is_float(16)) {
           suffix = "_fp16";

@@ -161,17 +161,18 @@ void BindFrontend(pybind11::module *m) {
 
             const auto &default_program_pass = DefaultTrainingOptimizeOptions().program_passes;
             const auto &default_graph_pass   = DefaultTrainingOptimizeOptions().graph_passes;
-            for (const auto &pass : passes) {
-              if (std::find(default_program_pass.begin(), default_program_pass.end(), pass) !=
-                  default_program_pass.end()) {
+            for (const auto &pass : default_program_pass) {
+              if (std::find(passes.begin(), passes.end(), pass) != passes.end()) {
                 program_passes.emplace_back(pass);
-              } else if (std::find(default_graph_pass.begin(), default_graph_pass.end(), pass) !=
-                         default_graph_pass.end()) {
-                graph_passes.emplace_back(pass);
-              } else {
-                LOG(WARNING) << "Cannot find pass: " << pass << " in CINN! Please check.";
               }
             }
+            for (const auto &pass : default_graph_pass) {
+              if (std::find(passes.begin(), passes.end(), pass) != passes.end()) {
+                graph_passes.emplace_back(pass);
+              }
+            }
+            CHECK_EQ(passes.size(), program_passes.size() + graph_passes.size())
+                << "Cannot found some test pass in CINN! Please check.";
             if (program_passes.empty()) {
               program_passes = default_program_pass;
             }
@@ -229,11 +230,47 @@ void BindFrontend(pybind11::module *m) {
               const std::unordered_set<std::string> &fetch_ids,
               const common::Target &target,
               const std::vector<std::string> &passes = {}) {
-             auto real_passes = passes;
-             if (real_passes.empty()) {
-               real_passes = DefaultTrainingOptimizeOptions().program_passes;
+             std::vector<std::string> program_passes, graph_passes;
+
+             const auto &default_program_pass = DefaultTrainingOptimizeOptions().program_passes;
+             const auto &default_graph_pass   = DefaultTrainingOptimizeOptions().graph_passes;
+             for (const auto &pass : default_program_pass) {
+               if (std::find(passes.begin(), passes.end(), pass) != passes.end()) {
+                 program_passes.emplace_back(pass);
+               }
              }
-             frontend::ProgramPass::Apply(&self, fetch_ids, target, real_passes);
+             for (const auto &pass : default_graph_pass) {
+               if (std::find(passes.begin(), passes.end(), pass) != passes.end()) {
+                 graph_passes.emplace_back(pass);
+               }
+             }
+             CHECK_EQ(passes.size(), program_passes.size() + graph_passes.size())
+                 << "Cannot found some test pass in CINN! Please check.";
+
+             if (program_passes.empty()) {
+               program_passes = default_program_pass;
+             }
+             frontend::ProgramPass::Apply(&self, fetch_ids, target, program_passes);
+
+             if (graph_passes.empty()) {
+               // no need run graph pass, return program size
+               return self.size();
+             }
+
+             auto graph = std::make_shared<hlir::framework::Graph>(self, fetch_ids, target);
+             hlir::framework::ApplyPasses(graph.get(), graph_passes);
+
+             size_t node_num = 0;
+             for (auto *graph_node : graph->nodes()) {
+               auto node = graph_node->safe_as<hlir::framework::Node>();
+               // if node is NodeData or not op, continue.
+               if (!node || node->op() == nullptr) {
+                 continue;
+               }
+
+               node_num++;
+             }
+             return node_num;
            })
 
       /**
@@ -461,18 +498,21 @@ void BindFrontend(pybind11::module *m) {
       .def("concat", &NetBuilder::Concat, py::arg("xs"), py::arg("axis") = 0)
       .def("reshape", &NetBuilder::Reshape, py::arg("x"), py::arg("shape"))
       .def("transpose", &NetBuilder::Transpose, py::arg("x"), py::arg("axis"))
+      .def("top_k", &NetBuilder::TopK, py::arg("x"), py::arg("k"), py::arg("axis"), py::arg("largest"))
+      .def("sort", &NetBuilder::Sort, py::arg("operand"), py::arg("axis"), py::arg("is_ascend"))
       .def("slice",
            &NetBuilder::Slice,
            py::arg("x"),
            py::arg("axes"),
            py::arg("starts"),
            py::arg("ends"),
-           py::arg("infer_flags") = std::vector<int>{},
-           py::arg("strides")     = std::vector<int>{})
+           py::arg("infer_flags")   = std::vector<int>{},
+           py::arg("strides")       = std::vector<int>{},
+           py::arg("decrease_axis") = std::vector<int>{})
       .def("reverse", &NetBuilder::Reverse, py::arg("x"), py::arg("axis"))
       .def("select", &NetBuilder::Select, py::arg("condition"), py::arg("true_value"), py::arg("false_value"))
       .def("split", &NetBuilder::Split, py::arg("x"), py::arg("num_or_sections"), py::arg("axis") = 0)
-      .def("index_select", &NetBuilder::IndexSelect, py::arg("x"), py::arg("index"), py::arg("axis") = 0)
+      .def("gather", &NetBuilder::Gather, py::arg("x"), py::arg("index"), py::arg("axis") = 0)
       .def("slice_assign",
            &NetBuilder::SliceAssign,
            py::arg("x"),
@@ -505,7 +545,8 @@ void BindFrontend(pybind11::module *m) {
            py::arg("x"),
            py::arg("y"),
            py::arg("x_num_col_dims") = 1,
-           py::arg("y_num_col_dims") = 1)
+           py::arg("y_num_col_dims") = 1,
+           py::arg("is_infer")       = false)
       .def("elementwise_add_grad",
            &NetBuilder::ElementwiseAddGrad,
            py::arg("dout"),
@@ -514,11 +555,19 @@ void BindFrontend(pybind11::module *m) {
            py::arg("axis") = -1)
       .def("relu6", &NetBuilder::Relu6, py::arg("a"), py::arg("threshold") = 6.0f)
       .def("gelu", &NetBuilder::Gelu, py::arg("x"))
-      .def("squeeze", &NetBuilder::Squeeze, py::arg("a"), py::arg("axes"))
-      .def("expand_dims", &NetBuilder::ExpandDims, py::arg("x"), py::arg("axis"), py::arg("num_newaxis") = 1)
+      .def("squeeze", &NetBuilder::Squeeze, py::arg("a"), py::arg("axes") = std::vector<int>{})
+      .def("expand_dims", &NetBuilder::ExpandDims, py::arg("x"), py::arg("axes"))
       .def("argmax", &NetBuilder::Argmax, py::arg("x"), py::arg("axis"), py::arg("keep_dim") = false)
       .def("argmin", &NetBuilder::Argmin, py::arg("x"), py::arg("axis"), py::arg("keep_dim") = false)
       .def("lookup_table", &NetBuilder::LookupTable, py::arg("table"), py::arg("ids"), py::arg("padding_idx"))
+      .def("one_hot",
+           &NetBuilder::OneHot,
+           py::arg("indices"),
+           py::arg("on_value"),
+           py::arg("off_value"),
+           py::arg("depth"),
+           py::arg("axis")  = -1,
+           py::arg("dtype") = "float32")
       .def("conv2d",
            &NetBuilder::Conv2d,
            py::arg("x"),
@@ -543,13 +592,28 @@ void BindFrontend(pybind11::module *m) {
            &NetBuilder::Pool2d,
            py::arg("x"),
            py::arg("polling_type"),
-           py::arg("ksize"),
-           py::arg("strides")           = std::vector<int>{1, 1},
-           py::arg("paddings")          = std::vector<int>{0, 0},
+           py::arg("kernel_size"),
+           py::arg("stride")            = std::vector<int>{1, 1},
+           py::arg("padding")           = std::vector<int>{0, 0},
            py::arg("ceil_mode")         = false,
            py::arg("exclusive")         = true,
            py::arg("global_pooling")    = false,
-           py::arg("data_format")       = "HCHW",
+           py::arg("data_format")       = "NCHW",
+           py::arg("adaptive")          = false,
+           py::arg("padding_algorithm") = "EXPLICIT")
+      .def("pool2d_grad",
+           &NetBuilder::Pool2dGrad,
+           py::arg("x"),
+           py::arg("y"),
+           py::arg("dy"),
+           py::arg("polling_type"),
+           py::arg("kernel_size"),
+           py::arg("stride")            = std::vector<int>{1, 1},
+           py::arg("padding")           = std::vector<int>{0, 0},
+           py::arg("ceil_mode")         = false,
+           py::arg("exclusive")         = true,
+           py::arg("global_pooling")    = false,
+           py::arg("data_format")       = "NCHW",
            py::arg("adaptive")          = false,
            py::arg("padding_algorithm") = "EXPLICIT")
       .def("batchnorm",
@@ -578,24 +642,18 @@ void BindFrontend(pybind11::module *m) {
            py::arg("scale")            = 1.0f,
            py::arg("bias")             = 0.0f,
            py::arg("bias_after_scale") = true)
-      .def("softmax", &NetBuilder::Softmax, py::arg("x"), py::arg("axis") = -1, py::arg("data_format") = "AnyLayout")
+      .def("softmax",
+           &NetBuilder::Softmax,
+           py::arg("x"),
+           py::arg("axes")        = std::vector<int>{-1},
+           py::arg("mode")        = "fast",
+           py::arg("data_format") = "AnyLayout")
       .def("dropout_infer",
            &NetBuilder::DropoutInfer,
            py::arg("x"),
            py::arg("dropout_prob")           = 0.5f,
            py::arg("dropout_implementation") = "downgrade_in_infer")
       .def("relu_grad", &NetBuilder::ReluGrad, py::arg("dout"), py::arg("x"))
-      .def("conv2d_grad",
-           &NetBuilder::Conv2dGrad,
-           py::arg("dy"),
-           py::arg("x"),
-           py::arg("w"),
-           py::arg("strides")           = std::vector<int>{1, 1},
-           py::arg("paddings")          = std::vector<int>{0, 0},
-           py::arg("dilations")         = std::vector<int>{1, 1},
-           py::arg("groups")            = 1,
-           py::arg("data_format")       = "NCHW",
-           py::arg("padding_algorithm") = "EXPLICIT")
       .def("sum", &NetBuilder::Sum, py::arg("inputs"))
       .def("matmul",
            &NetBuilder::Matmul,
@@ -619,8 +677,27 @@ void BindFrontend(pybind11::module *m) {
       .def("cast", &NetBuilder::Cast, py::arg("x"), py::arg("dtype"))
       .def("clip", &NetBuilder::Clip, py::arg("x"), py::arg("max"), py::arg("min"))
       .def("arange", &NetBuilder::Arange, py::arg("start"), py::arg("end"), py::arg("step"), py::arg("dtype"))
-      .def("gather", &NetBuilder::Gather, py::arg("x"), py::arg("index"), py::arg("axis"))
-      .def("gather_nd", &NetBuilder::GatherNd, py::arg("x"), py::arg("index"), py::arg("axes"));
+      .def("gather_nd", &NetBuilder::GatherNd, py::arg("x"), py::arg("index"))
+      .def("cbrt", &NetBuilder::Cbrt, py::arg("x"))
+      .def("clz", &NetBuilder::Clz, py::arg("x"))
+      .def("popc", &NetBuilder::Popc, py::arg("x"))
+      .def("reciprocal", &NetBuilder::Reciprocal, py::arg("x"))
+      .def("gaussian_random",
+           &NetBuilder::GaussianRandom,
+           py::arg("shape"),
+           py::arg("mean")  = 0.0f,
+           py::arg("std")   = 1.0f,
+           py::arg("seed")  = 0,
+           py::arg("dtype") = "float32")
+      .def("uniform_random",
+           &NetBuilder::UniformRandom,
+           py::arg("shape"),
+           py::arg("min")   = -1.0f,
+           py::arg("max")   = 1.0f,
+           py::arg("seed")  = 0,
+           py::arg("dtype") = "float32")
+      .def("norm", &NetBuilder::Norm, py::arg("x"), py::arg("axis") = -1, py::arg("epsilon") = 1e-12f)
+      .def("cholesky", &NetBuilder::Cholesky, py::arg("x"), py::arg("upper") = false);
 
   auto computation = py::class_<CinnComputation, std::shared_ptr<CinnComputation>>(*m, "Computation");
   py::class_<CinnComputation::CompileOptions>(computation, "CompileOptions")

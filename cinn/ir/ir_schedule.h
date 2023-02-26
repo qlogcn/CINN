@@ -77,6 +77,9 @@ class IRSchedule {
   //! Get the ModuleExpr stored in ScheduleImpl.
   const ModuleExpr& GetModule() const;
 
+  //! Determine whether a specific block is included
+  bool HasBlock(const std::string& block_name) const;
+
   //! Merge multiple Exprs in a ModuleExpr to be one
   void MergeExprs();
 
@@ -102,6 +105,13 @@ class IRSchedule {
 
   //! Get a block with the specific name.
   Expr GetBlock(const std::string& block_name) const;
+
+  /**
+   * \brief Get all the childblocks of specific Expr stored in ModuleExpr.
+   * @param expr The expr we find childblock in, can be a loop or block.
+   * @return ChildBlocks of the block.
+   */
+  std::vector<Expr> GetChildBlocks(const Expr& expr) const;
 
   /**
    * \brief Split a for loop into multiple loops, based on the factors.
@@ -144,7 +154,7 @@ class IRSchedule {
   Expr Fuse(const Expr& block, const std::vector<int>& loops_index);
 
   /**
-   * \brief Move a block's location under a loop.
+   * \brief Move a producer block's location under a specific loop.
    * @param block The block we want to move its computation location.
    * @param loop The loop we will move the block to.
    */
@@ -156,6 +166,13 @@ class IRSchedule {
    * @param loop The loop we will move the block to.
    */
   void SimpleComputeAt(const Expr& block, const Expr& loop);
+
+  /**
+   * \brief Move a consumer block's location under a specific loop.
+   * @param block The block we want to move its computation location.
+   * @param loop The loop we will move the block to.
+   */
+  void ReverseComputeAt(const Expr& block, const Expr& loop);
 
   /**
    * \brief Find an expr's root ScheduleBlockRealize node
@@ -201,22 +218,34 @@ class IRSchedule {
   /**
    * \brief Reorder the loops in the order of vector.
    * @param loops The loops to be reordered.
+   * @return The reordered Expr, can be ir::For or ir::Block. It is ir::For if
+   *   the reordered loop is a single loop chain. It will be a ir::Block whose
+   *   stmts contain several loop chains if the reordered computation has
+   *   multiple loop chains.
    */
-  void Reorder(const std::vector<Expr>& loops);
+  Expr Reorder(const std::vector<Expr>& loops);
 
   /**
    * \brief Reorder the loops in the order of vector elements.
    * @param block_name Name of the block we want to modify.
    * @param loops_index Indices of loops to be reordered.
+   * @return The reordered Expr, can be ir::For or ir::Block. It is ir::For if
+   *   the reordered loop is a single loop chain. It will be a ir::Block whose
+   *   stmts contain several loop chains if the reordered computation has
+   *   multiple loop chains.
    */
-  void Reorder(const std::string& block_name, const std::vector<int>& loops_index);
+  Expr Reorder(const std::string& block_name, const std::vector<int>& loops_index);
 
   /**
    * \brief Reorder the loops in the order of vector elements.
    * @param block The block we want to modify.
    * @param loops_index Indices of loops to be reordered.
+   * @return The reordered Expr, can be ir::For or ir::Block. It is ir::For if
+   *   the reordered loop is a single loop chain. It will be a ir::Block whose
+   *   stmts contain several loop chains if the reordered computation has
+   *   multiple loop chains.
    */
-  void Reorder(const Expr& block, const std::vector<int>& loops_index);
+  Expr Reorder(const Expr& block, const std::vector<int>& loops_index);
 
   /**
    * Get the device api of this IRSchedule.
@@ -312,6 +341,37 @@ class IRSchedule {
    * \param val The attribute value, its type should be one of attr_t listing
    */
   void Annotate(const Expr& block, const std::string& key, const attr_t& value);
+
+  /*!
+   * \brief To cancel an annotation within a block using the key
+   * \param block The block to be unannotated
+   * \param key The attribute key
+   */
+  void Unannotate(Expr& block, const std::string& key);
+
+  /*!
+   * \brief flatten the loops in one dim.
+   * \param loops  the loops to be flatted.
+   * \param force_flat force to flat the right value.
+   */
+  // Temporary solution for simplify the elementwise/broadcast/injective index.
+  // TODO(sunli): Solve Index Simplify.
+  void FlattenLoops(const std::vector<Expr>& loops, const bool force_flat = false);
+
+  /*!
+   * \brief Sample the factors to tile a specific loop perfectly
+   * \param loop the loop to be split
+   * \param n the number of loop layers to split
+   * \param max_innermost_factor the maximum factor of the innermost loop
+   * \return the split factors of the loop (The larger the index, the inner the corresponding loop)
+   * For example, return {16,64} means the loop will be like this:
+   * for (i, 0, 16) {
+   *  for (j, 0, 64) {
+   *   ...
+   *  }
+   * }
+   */
+  std::vector<Expr> SamplePerfectTile(const Expr& loop, int n, int max_innermost_factor);
 
  private:
   std::unique_ptr<ScheduleImpl> impl_;

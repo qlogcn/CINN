@@ -312,10 +312,22 @@ std::vector<ir::LoweredFunc> GraphCompiler::GetOpFuncWithIRSchedule(
       input = lang::Placeholder<float16>(id, shape);
     } else if (dtype.is_bool()) {
       input = lang::Placeholder<bool>(id, shape);
+    } else if (dtype.is_int(8)) {
+      input = lang::Placeholder<int8_t>(id, shape);
+    } else if (dtype.is_int(16)) {
+      input = lang::Placeholder<int16_t>(id, shape);
     } else if (dtype.is_int(32)) {
       input = lang::Placeholder<int32_t>(id, shape);
     } else if (dtype.is_int(64)) {
       input = lang::Placeholder<int64_t>(id, shape);
+    } else if (dtype.is_uint(8)) {
+      input = lang::Placeholder<uint8_t>(id, shape);
+    } else if (dtype.is_uint(16)) {
+      input = lang::Placeholder<uint16_t>(id, shape);
+    } else if (dtype.is_uint(32)) {
+      input = lang::Placeholder<uint32_t>(id, shape);
+    } else if (dtype.is_uint(64)) {
+      input = lang::Placeholder<uint64_t>(id, shape);
     }
     tensor_inputs.push_back(input);
     cinn_inputs.push_back(common::CINNValue(input));
@@ -366,10 +378,22 @@ std::vector<ir::LoweredFunc> GraphCompiler::GetOpFunc(const Node* node) {
       temp = lang::Placeholder<float16>(input_id, in_shape);
     } else if (dtype.is_bool()) {
       temp = lang::Placeholder<bool>(input_id, in_shape);
+    } else if (dtype.is_int(8)) {
+      temp = lang::Placeholder<int8_t>(input_id, in_shape);
+    } else if (dtype.is_int(16)) {
+      temp = lang::Placeholder<int16_t>(input_id, in_shape);
     } else if (dtype.is_int(32)) {
       temp = lang::Placeholder<int32_t>(input_id, in_shape);
     } else if (dtype.is_int(64)) {
       temp = lang::Placeholder<int64_t>(input_id, in_shape);
+    } else if (dtype.is_uint(8)) {
+      temp = lang::Placeholder<uint8_t>(input_id, in_shape);
+    } else if (dtype.is_uint(16)) {
+      temp = lang::Placeholder<uint16_t>(input_id, in_shape);
+    } else if (dtype.is_uint(32)) {
+      temp = lang::Placeholder<uint32_t>(input_id, in_shape);
+    } else if (dtype.is_uint(64)) {
+      temp = lang::Placeholder<uint64_t>(input_id, in_shape);
     }
     inputs.push_back(temp);
     cinn_inputs.push_back(common::CINNValue(temp));
@@ -474,10 +498,22 @@ std::vector<ir::LoweredFunc> GraphCompiler::GetOpFunc(const std::vector<Node*>& 
           temp_in = lang::Placeholder<float16>(input_id, in_shape);
         } else if (dtype.is_bool()) {
           temp_in = lang::Placeholder<bool>(input_id, in_shape);
+        } else if (dtype.is_int(8)) {
+          temp_in = lang::Placeholder<int8_t>(input_id, in_shape);
+        } else if (dtype.is_int(16)) {
+          temp_in = lang::Placeholder<int16_t>(input_id, in_shape);
         } else if (dtype.is_int(32)) {
           temp_in = lang::Placeholder<int32_t>(input_id, in_shape);
         } else if (dtype.is_int(64)) {
           temp_in = lang::Placeholder<int64_t>(input_id, in_shape);
+        } else if (dtype.is_uint(8)) {
+          temp_in = lang::Placeholder<uint8_t>(input_id, in_shape);
+        } else if (dtype.is_uint(16)) {
+          temp_in = lang::Placeholder<uint16_t>(input_id, in_shape);
+        } else if (dtype.is_uint(32)) {
+          temp_in = lang::Placeholder<uint32_t>(input_id, in_shape);
+        } else if (dtype.is_uint(64)) {
+          temp_in = lang::Placeholder<uint64_t>(input_id, in_shape);
         }
         inputs.push_back(temp_in);
         temp_inputs.push_back(temp_in);
@@ -642,42 +678,43 @@ std::vector<ir::LoweredFunc> GraphCompiler::GetOpFunc(const std::vector<Node*>& 
   return func;
 }
 
-void GraphCompiler::ProcessFunction(const std::vector<ir::LoweredFunc>& lowered_func) {
-  if (lowered_func.size() > 1) {
-    for (auto& i : lowered_func) {
-      VLOG(3) << "In lowered_func, its name is : " << i->name;
-      std::vector<std::string> input_args;
-      std::vector<std::string> output_args;
-      for (auto& j : i->args) {
-        std::string temp_arg = j.name();
-        if (temp_arg[0] == '_') temp_arg = temp_arg.substr(1);
-        if (j.io == ir::Argument::IO::kOutput)
-          output_args.push_back(temp_arg);
-        else if (j.io == ir::Argument::IO::kInput)
-          input_args.push_back(temp_arg);
-        auto* var = scope_->FindVar(temp_arg);
-        // For tensor not in scope, create it.
-        if (!var) {
-          auto* new_var = scope_->Var<Tensor>(temp_arg);
-          auto& tensor  = absl::get<Tensor>(*new_var);
-          std::vector<Shape::dim_t> shape;
-          CHECK(j.is_buffer());
-          VLOG(3) << "Tensor " << temp_arg << " is not found in scope. Now create it with shape:";
-          for (auto& shape_dim : j.buffer_arg()->shape) {
-            VLOG(3) << shape_dim << ",";
-            CHECK(shape_dim.is_constant());
-            shape.push_back(static_cast<int>(shape_dim.get_constant()));
-          }
-          tensor->Resize(Shape{shape});
-          tensor->set_type(j.type());
-        }
+void GraphCompiler::ProcessFunction(const std::vector<ir::LoweredFunc>& lowered_funcs) {
+  for (auto&& func : lowered_funcs) {
+    std::vector<std::string> input_args;
+    std::vector<std::string> output_args;
+    for (auto&& arg : func->args) {
+      std::string arg_name = arg.name();
+      if (arg_name[0] == '_') arg_name = arg_name.substr(1);
+      if (arg.io == ir::Argument::IO::kOutput)
+        output_args.push_back(arg_name);
+      else if (arg.io == ir::Argument::IO::kInput)
+        input_args.push_back(arg_name);
+      auto* var = scope_->FindVar(arg_name);
+      if (!arg.is_buffer()) {
+        VLOG(3) << "function:" << func->name << "-argument:" << arg_name << " type is not buffer, lowered_func:\n"
+                << func;
       }
-      function2input_args_[i->name]  = input_args;
-      function2output_args_[i->name] = output_args;
-      m_builder_.AddFunction(i);
+      if (!var && arg.is_buffer()) {  // For argument buffer not in scope, create it.
+        auto* new_var = scope_->Var<Tensor>(arg_name);
+        auto& tensor  = absl::get<Tensor>(*new_var);
+        std::vector<Shape::dim_t> shape;
+        for (auto& shape_dim : arg.buffer_arg()->shape) {
+          CHECK(shape_dim.is_constant());
+          shape.push_back(static_cast<int>(shape_dim.get_constant()));
+        }
+        tensor->Resize(Shape{shape});
+        tensor->set_type(arg.buffer_arg()->dtype);
+        VLOG(3) << utils::StringFormat(
+            "Will create a new variable in scope for argument[%s] in function[%s] with shape[%s],dtype[%s]",
+            arg_name.c_str(),
+            func->name.c_str(),
+            utils::Join(tensor->shape().data(), ","),
+            common::Type2Str(tensor->type()));
+      }
     }
-  } else {
-    m_builder_.AddFunction(lowered_func[0]);
+    function2input_args_[func->name]  = input_args;
+    function2output_args_[func->name] = output_args;
+    m_builder_.AddFunction(func);
   }
 }
 
@@ -691,15 +728,9 @@ std::unique_ptr<Program> GraphCompiler::Build(const std::string& code) {
 }
 
 void GraphCompiler::CompileOptions::Apply(const auto_schedule::TuningResult& tuning_result) {
-  // joint all sub_graph into a whole graph
-  for (auto&& sub_graph : tuning_result.tuned_graph) {
-    groups.insert(groups.end(), sub_graph.groups.begin(), sub_graph.groups.end());
-  }
-
-  // joint all lowered_funcs together
-  for (auto&& expr : tuning_result.optimized_exprs) {
-    lowered_funcs.insert(lowered_funcs.end(), expr.lowered_funcs.begin(), expr.lowered_funcs.end());
-  }
+  // assign options with TuningResult directly
+  groups.assign(tuning_result.subgraphs.begin(), tuning_result.subgraphs.end());
+  lowered_funcs.assign(tuning_result.function_groups.begin(), tuning_result.function_groups.end());
 }
 
 GraphCompiler::CompilationResult GraphCompiler::Build(const GraphCompiler::CompileOptions& options,
@@ -785,19 +816,6 @@ GraphCompiler::CompilationResult GraphCompiler::Build(const GraphCompiler::Compi
       for (auto& group : graph_->fusion_groups) {
         VLOG(3) << "group_id is : " << group->group_id << ", and its number is : " << group->nodes.size();
         groups.push_back(std::move(group->CollectNodes()));
-        // set node as output node from fetch_var_ids.
-        for (auto node : groups.back()) {
-          // get all node datas.
-          for (auto& link : node->outlinks()) {
-            auto node_data = link->sink()->safe_as<NodeData>();
-            CHECK(node_data);
-            // if node data is in fetch_var_ids.
-            if (fetch_var_ids_.count(node_data->id())) {
-              group->output_nodes.insert(node);
-              break;
-            }
-          }
-        }
         local_lowered_funcs.emplace_back(std::move(op_lowerer.Lower(group)));
         CHECK_EQ(local_lowered_funcs.back().size(), 1) << "Lowerd Function Is Not Equal 1!";
         VLOG(3) << local_lowered_funcs.back()[0];
@@ -1257,7 +1275,7 @@ static void BufferMallocWithCallback(void* args, int num_args) {
   cinn_pod_value_t* pod_args = static_cast<cinn_pod_value_t*>(args);
   for (int i = 0; i < num_args; ++i) {
     cinn_buffer_t* buffer = static_cast<cinn_buffer_t*>(pod_args[i]);
-    CHECK(buffer->external_malloc) << "external_malloc is nullptr";
+    CHECK(buffer->external_malloc) << "external_malloc is nullptr at " << i << "-th argumemnts";
     buffer->external_malloc->operator()(nullptr, buffer);
   }
 }
@@ -1318,6 +1336,7 @@ void GraphCompiler::InsertBufferHandlers(std::vector<std::unique_ptr<Instruction
       auto function_name           = "malloc_buffer_instruction_" + std::to_string(step);
       auto malloc_instr            = std::make_unique<Instruction>(
           common::DefaultHostTarget(), scope_.get(), malloc_var_names, std::vector<std::string>({}), function_name);
+      VLOG(4) << "seting malloc function " << function_name << " for var " << cinn::utils::Join(malloc_var_names, ", ");
       malloc_instr->SetLoweredFunc(reinterpret_cast<void*>(BufferMallocWithCallback), function_name);
       malloc_instr->Finalize();
       results.emplace_back(std::move(malloc_instr));
@@ -1334,6 +1353,7 @@ void GraphCompiler::InsertBufferHandlers(std::vector<std::unique_ptr<Instruction
       auto function_name         = "free_buffer_instruction_" + std::to_string(step);
       auto free_instr            = std::make_unique<Instruction>(
           common::DefaultHostTarget(), scope_.get(), std::vector<std::string>({}), free_var_names, function_name);
+      VLOG(4) << "seting free function " << function_name << " for var " << cinn::utils::Join(free_var_names, ", ");
       free_instr->SetLoweredFunc(reinterpret_cast<void*>(BufferFreeWithCallback), function_name);
       free_instr->Finalize();
       results.emplace_back(std::move(free_instr));
@@ -1457,15 +1477,15 @@ std::vector<ir::LoweredFunc> GetFuncFromImpl(const std::shared_ptr<OpImpl>& impl
   CHECK_EQ(funcs_after_schedule.size(), expr_pack.size());
   std::vector<ir::LoweredFunc> res;
   for (int i = 0; i < funcs_after_schedule.size(); i++) {
+#ifdef CINN_WITH_CUDA
+    optim::OptimizeExprGPU(&(funcs_after_schedule[i]->body));
+#endif
     auto temp_buffers                  = lang::GetTempBuffers(all_arg_tensors, stages, funcs_after_schedule[i]->body);
     funcs_after_schedule[i]->temp_bufs = temp_buffers;
     funcs_after_schedule[i]            = ir::_LoweredFunc_::Make(funcs_after_schedule[i]->name,
                                                       funcs_after_schedule[i]->args,
                                                       funcs_after_schedule[i]->body,
                                                       funcs_after_schedule[i]->temp_bufs);
-#ifdef CINN_WITH_CUDA
-    optim::OptimizeExprGPU(&(funcs_after_schedule[i]->body));
-#endif
     res.emplace_back(optim::Optimize(Expr(funcs_after_schedule[i]), target, false).as_lowered_func_ref());
   }
   // 5. Return the result.

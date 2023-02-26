@@ -22,7 +22,7 @@
 
 #include "cinn/hlir/framework/graph.h"
 #include "cinn/hlir/framework/node.h"
-#include "cinn/hlir/pass/op_fusion_pass.h"
+#include "cinn/hlir/framework/pass.h"
 
 namespace cinn {
 namespace auto_schedule {
@@ -40,15 +40,15 @@ std::vector<TuneTask> TaskCreator::CreateTuneTaskOpLevel(Graph* graph) {
   std::vector<std::shared_ptr<Graph::Group>> non_fused_groups;
   // The input graph doesn't run Op Fusion
   if (graph->fusion_groups.empty()) {
-    non_fused_groups = hlir::pass::BuildNonFusedGroups(graph);
-    groups           = &non_fused_groups;
+    hlir::framework::ApplyPasses(graph, {"BuildNonFusedGroupsPass"});
+    groups = &graph->fusion_groups;
   }
   VLOG(3) << "Graph groups size:" << groups->size();
 
   for (const auto& sub_graph : *groups) {
     ret_tasks.emplace_back(TuneTask());
-    ret_tasks.back().task_graph.push_back(sub_graph);
-    ret_tasks.back().target = graph->target_;
+    ret_tasks.back().subgraph = sub_graph;
+    ret_tasks.back().target   = graph->target_;
   }
   return ret_tasks;
 }

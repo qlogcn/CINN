@@ -27,6 +27,7 @@ DEFINE_bool(cinn_cudnn_deterministic,
 
 using ::GFLAGS_NAMESPACE::BoolFromEnv;
 using ::GFLAGS_NAMESPACE::Int32FromEnv;
+using ::GFLAGS_NAMESPACE::Int64FromEnv;
 using ::GFLAGS_NAMESPACE::StringFromEnv;
 
 DEFINE_string(cinn_x86_builtin_code_root, StringFromEnv("FLAGS_cinn_x86_builtin_code_root", ""), "");
@@ -36,14 +37,21 @@ DEFINE_int32(cinn_parallel_compile_size,
              Int32FromEnv("FLAGS_cinn_parallel_compile_size", 0),
              "When use parallel compile, set the number of group compiled by each thread.");
 
-DEFINE_bool(cinn_open_fusion_optimize,
-            BoolFromEnv("FLAGS_cinn_open_fusion_optimize", true),
-            "Whether use the op_fusion optimization.");
+DEFINE_bool(cinn_use_op_fusion, BoolFromEnv("FLAGS_cinn_use_op_fusion", true), "Whether to use op fusion pass.");
 
-// FLAGS to switch optimization status
-DEFINE_bool(cinn_use_new_fusion_pass,
-            BoolFromEnv("FLAGS_cinn_use_new_fusion_pass", true),
-            "Whether use the new op_fusion and fusion_merge pass.");
+DEFINE_bool(cinn_use_cublas_gemm, BoolFromEnv("FLAGS_cinn_use_cublas_gemm", true), "Whether to use cublas gemm.");
+
+DEFINE_bool(cinn_use_common_subexpression_elimination,
+            BoolFromEnv("FLAGS_cinn_use_common_subexpression_elimination", false),
+            "Whether to use common subexpression elimination pass.");
+
+DEFINE_string(cinn_custom_call_deny_ops,
+              StringFromEnv("FLAGS_cinn_custom_call_deny_ops", ""),
+              "a blacklist of op are denied by MarkCustomCallOps pass, separated by ;");
+
+DEFINE_bool(cinn_use_custom_call,
+            BoolFromEnv("FLAGS_cinn_use_custom_call", true),
+            "Whether to use custom_call for ops with external_api registered");
 
 DEFINE_bool(cinn_use_fill_constant_folding,
             BoolFromEnv("FLAGS_cinn_use_fill_constant_folding", false),
@@ -70,6 +78,10 @@ DEFINE_bool(cinn_sync_run,
 DEFINE_bool(cinn_self_check_accuracy,
             BoolFromEnv("FLAGS_cinn_self_check_accuracy", false),
             "Whether self-check accuracy after each instruction run, which is used for debug.");
+
+DEFINE_int64(cinn_self_check_accuracy_num,
+             Int64FromEnv("FLAGS_cinn_self_check_accuracy_num", 0L),
+             "Set self-check accuracy print numel, which is used for debug.");
 
 DEFINE_string(cinn_fusion_groups_graphviz_dir,
               StringFromEnv("FLAGS_cinn_fusion_groups_graphviz_dir", ""),

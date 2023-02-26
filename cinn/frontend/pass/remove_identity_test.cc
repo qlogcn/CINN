@@ -82,7 +82,7 @@ TEST(RemoveIdentity, remove_multiple) {
   auto identity_1 = builder.Identity(x);
   auto identity_2 = builder.Identity(identity_1);
   auto identity_3 = builder.Identity(identity_2);
-  auto mul_1      = builder.Mul(identity_3, y);
+  auto mul_1      = builder.Add(identity_3, y);
 
   PassTest tester;
   std::vector<std::string> input_names    = {x.id().data(), y.id().data()};
@@ -110,14 +110,14 @@ TEST(RemoveIdentity, cannot_remove_fetch) {
   auto relu_1     = builder.Relu(x);
   auto identity_1 = builder.Identity(relu_1);
   auto identity_2 = builder.Identity(identity_1);
-  auto mul_1      = builder.Mul(identity_2, y);
+  auto mul_1      = builder.Add(identity_2, y);
 
   PassTest tester;
   std::vector<std::string> input_names    = {x.id().data(), y.id().data()};
   std::vector<std::string> output_names   = {identity_2->id, mul_1->id};
   std::vector<std::string> program_passes = {"RemoveIdentity"};
   int num_removed_ops                     = tester.RunAndCheck(builder, program_passes, input_names, output_names);
-  ASSERT_EQ(num_removed_ops, 2);
+  ASSERT_EQ(num_removed_ops, 1);
 }
 
 }  // namespace cinn::frontend

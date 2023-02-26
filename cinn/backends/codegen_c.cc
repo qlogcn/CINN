@@ -34,6 +34,7 @@ DECLARE_string(cinn_x86_builtin_code_root);
 namespace cinn {
 namespace backends {
 using namespace utils;  // NOLINT
+using cinn::common::float16;
 
 const char *kCKeywordRestrict = "__restrict__";
 
@@ -98,9 +99,18 @@ std::string CodeGenC::GetTypeName(Type type) {
 
   GET_SCALAR_TYPE(type.is_void(), "void");
   GET_SCALAR_TYPE(type.is_bool(), "bool");
+
   GET_SCALAR_TYPE(type.is_int(8), "int8_t");
+  GET_SCALAR_TYPE(type.is_int(16), "int16_t");
   GET_SCALAR_TYPE(type.is_int(32), "int32_t");
   GET_SCALAR_TYPE(type.is_int(64), "int64_t");
+
+  GET_SCALAR_TYPE(type.is_uint(8), "uint8_t");
+  GET_SCALAR_TYPE(type.is_uint(16), "uint16_t");
+  GET_SCALAR_TYPE(type.is_uint(32), "uint32_t");
+  GET_SCALAR_TYPE(type.is_uint(64), "uint64_t");
+
+  GET_SCALAR_TYPE(type.is_float(16), "float16");
   GET_SCALAR_TYPE(type.is_float(32), "float")
   GET_SCALAR_TYPE(type.is_float(64), "double")
 #undef GET_SCALAR_TYPE
@@ -662,10 +672,26 @@ void CodeGenC::PrintFuncArg(const ir::Argument &arg) {
 }
 
 void CodeGenC::PrintRuntimeType(const cinn_type_t &type) {
-  if (type == cinn_int32_t()) {
+  if (type == cinn_bool_t()) {
+    os() << "cinn_bool_t()";
+  } else if (type == cinn_int8_t()) {
+    os() << "cinn_int8_t()";
+  } else if (type == cinn_int16_t()) {
+    os() << "cinn_int16_t()";
+  } else if (type == cinn_int32_t()) {
     os() << "cinn_int32_t()";
   } else if (type == cinn_int64_t()) {
     os() << "cinn_int64_t()";
+  } else if (type == cinn_uint8_t()) {
+    os() << "cinn_uint8_t()";
+  } else if (type == cinn_uint16_t()) {
+    os() << "cinn_uint16_t()";
+  } else if (type == cinn_uint32_t()) {
+    os() << "cinn_uint32_t()";
+  } else if (type == cinn_uint64_t()) {
+    os() << "cinn_uint64_t()";
+  } else if (type == cinn_float16_t()) {
+    os() << "cinn_float16_t()";
   } else if (type == cinn_float32_t()) {
     os() << "cinn_float32_t()";
   } else if (type == cinn_float64_t()) {
@@ -714,10 +740,26 @@ void CodeGenC::Visit(const ir::intrinsics::PodValueToX *op) {
     os() << runtime::intrinsic::pod_value_to_float;
   } else if (to_type == type_of<double>()) {
     os() << runtime::intrinsic::pod_value_to_double;
+  } else if (to_type == type_of<float16>()) {
+    os() << runtime::intrinsic::pod_value_to_float16;
+  } else if (to_type == type_of<bool>()) {
+    os() << runtime::intrinsic::pod_value_to_bool;
+  } else if (to_type == type_of<int8_t>()) {
+    os() << runtime::intrinsic::pod_value_to_int8;
+  } else if (to_type == type_of<int16_t>()) {
+    os() << runtime::intrinsic::pod_value_to_int16;
   } else if (to_type == type_of<int32_t>()) {
     os() << runtime::intrinsic::pod_value_to_int32;
   } else if (to_type == type_of<int64_t>()) {
     os() << runtime::intrinsic::pod_value_to_int64;
+  } else if (to_type == type_of<uint8_t>()) {
+    os() << runtime::intrinsic::pod_value_to_uint8;
+  } else if (to_type == type_of<uint16_t>()) {
+    os() << runtime::intrinsic::pod_value_to_uint16;
+  } else if (to_type == type_of<uint32_t>()) {
+    os() << runtime::intrinsic::pod_value_to_uint32;
+  } else if (to_type == type_of<uint64_t>()) {
+    os() << runtime::intrinsic::pod_value_to_uint64;
   } else if (to_type == type_of<void *>()) {
     os() << runtime::intrinsic::pod_value_to_void_p;
   } else if (to_type == type_of<cinn_buffer_t *>()) {

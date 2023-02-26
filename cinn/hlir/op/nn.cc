@@ -19,6 +19,7 @@
 #include "cinn/hlir/framework/node.h"
 #include "cinn/hlir/framework/op.h"
 #include "cinn/hlir/framework/op_strategy.h"
+#include "cinn/hlir/op/op_util.h"
 #include "cinn/hlir/pe/broadcast.h"
 #include "cinn/hlir/pe/elementwise.h"
 #include "cinn/hlir/pe/ir_schedule_pe.h"
@@ -63,7 +64,7 @@ std::shared_ptr<OpStrategy> StrategyForRelu(const framework::NodeAttr &attrs,
 
   auto strategy = std::make_shared<framework::OpStrategy>();
   CHECK(out_type.size()) << "Out_type of relu op is empty! Please check.";
-  strategy->AddImpl(relu_compute, framework::GetInjectiveScheduleFunc(output_shapes, target), "strategy.relu.x86", 1);
+  strategy->AddImpl(relu_compute, GetInjectiveScheduleFunc(output_shapes, target), "strategy.relu.x86", 1);
   return strategy;
 }
 
@@ -104,7 +105,7 @@ std::shared_ptr<OpStrategy> StrategyForRelu6(const framework::NodeAttr &attrs,
 
   auto strategy = std::make_shared<framework::OpStrategy>();
   CHECK(out_type.size()) << "Out_type of relu6 op is empty! Please check.";
-  strategy->AddImpl(relu6_compute, framework::GetInjectiveScheduleFunc(output_shapes, target), "strategy.relu6.x86", 1);
+  strategy->AddImpl(relu6_compute, GetInjectiveScheduleFunc(output_shapes, target), "strategy.relu6.x86", 1);
   return strategy;
 }
 
@@ -459,23 +460,23 @@ std::shared_ptr<OpStrategy> StrategyForConv2d(const framework::NodeAttr &attrs,
 
   auto strategy = std::make_shared<framework::OpStrategy>();
   CHECK(out_type.size()) << "Out_type of conv2d op is empty! Please check.";
-  if (out_type[0] == Float(32)) {
-    strategy->AddImpl(conv2d_compute, conv2d_schedule, "strategy.conv2d.x86", 1);
-  } else {
-    LOG(FATAL) << "Conv2d op with dtype != float32 is not implemented yet!";
-  }
+  strategy->AddImpl(conv2d_compute, conv2d_schedule, "strategy.conv2d.x86", 1);
   return strategy;
 }
 
 std::vector<shape_t> InferShapeForConv2d(const std::vector<shape_t> &inputs_shape,
                                          const framework::AttrMapType &attrs) {
-  CHECK(!inputs_shape.empty() && !inputs_shape[0].empty()) << "The input's shape size is 0! Please check again.";
+  CHECK_EQ(inputs_shape.size(), 2) << "The conv2d should has and only has 2 inputs";
+  CHECK_EQ(inputs_shape[0].size(), 4) << "The conv2d's first input only support 4-dimension tensor";
+  CHECK_EQ(inputs_shape[1].size(), 4) << "The conv2d's first input only support 4-dimension tensor";
+
   std::vector<int> padding({0, 0});
   std::vector<int> stride({1, 1});
   std::vector<int> dilation({1, 1});
   int groups              = 1;
   std::string data_format = "NCHW";
-  std::string conv_type   = "";
+  std::string conv_type   = "forward";
+
   if (attrs.find("padding") != attrs.end()) {
     padding = absl::get<std::vector<int>>(attrs.at("padding"));
   }
@@ -490,11 +491,12 @@ std::vector<shape_t> InferShapeForConv2d(const std::vector<shape_t> &inputs_shap
   }
   if (attrs.find("data_format") != attrs.end()) {
     data_format = absl::get<std::string>(attrs.at("data_format"));
+    if (data_format == "AnyLayout") {
+      data_format = "NCHW";
+    }
   }
   if (attrs.find("conv_type") != attrs.end()) {
     conv_type = absl::get<std::string>(attrs.at("conv_type"));
-  } else {
-    conv_type = "forward";
   }
 
   CHECK_EQ(padding.size(), 2) << "The size of padding in conv2d op is not 2! Please check.";
@@ -502,32 +504,56 @@ std::vector<shape_t> InferShapeForConv2d(const std::vector<shape_t> &inputs_shap
   CHECK_GE(inputs_shape[0].size(), 3) << "The first input tensor's shape size of conv2d op is < 3! Please check.";
   CHECK(conv_type == "forward" || conv_type == "backward_data" || conv_type == "backward_filter")
       << "The conv type should be one of {forward, backward_data, backward_filter}.";
+  CHECK(data_format == "NCHW" || data_format == "NHWC")
+      << "The conv2d only support NCHW/NHWC, but here " << data_format;
 
-  std::vector<shape_t> res;
-  if (data_format == "NCHW") {
+  int n = 0, c = 1, h = 2, w = 3;
+  if (data_format == "NHWC") {
+    n = 0;
+    h = 1;
+    w = 2;
+    c = 3;
+  }
+
+  std::vector<int> output_shape(4, 0);
+  int out_shape_h = 0, out_shape_w = 0;
+  if (conv_type == "forward") {
     // A is input: [N, C, H, W], B is filter: [C_out, C_in/group, filter_h, filter_w]
-    int out_shape_h = 0, out_shape_w = 0;
-    if (conv_type == "forward") {
-      out_shape_h =
-          (inputs_shape[0][2] - ((inputs_shape[1][2] - 1) * dilation[0] + 1) + 2 * padding[0]) / stride[0] + 1;
-      out_shape_w =
-          (inputs_shape[0][3] - ((inputs_shape[1][3] - 1) * dilation[1] + 1) + 2 * padding[1]) / stride[1] + 1;
-    } else if (conv_type == "backward_data") {
-      CHECK(attrs.find("output_shape") != attrs.end()) << "The shape of filter is not found! Please check.";
-      auto data_shape = absl::get<std::vector<int>>(attrs.at("output_shape"));
-      CHECK_EQ(data_shape.size(), 4) << "The size of filter shape is not 4(oc, ic, fh, fw)!Please check";
-      out_shape_h = data_shape[2];
-      out_shape_w = data_shape[3];
-    } else if (conv_type == "backward_filter") {
-      CHECK(attrs.find("output_shape") != attrs.end()) << "The shape of filter is not found! Please check.";
-      auto filter_shape = absl::get<std::vector<int>>(attrs.at("output_shape"));
-      CHECK_EQ(filter_shape.size(), 4) << "The size of filter shape is not 4(oc, ic, fh, fw)!Please check";
-      out_shape_h = filter_shape[2];
-      out_shape_w = filter_shape[3];
-    }
+    out_shape_h = (inputs_shape[0][h] - ((inputs_shape[1][h] - 1) * dilation[0] + 1) + 2 * padding[0]) / stride[0] + 1;
+    out_shape_w = (inputs_shape[0][w] - ((inputs_shape[1][w] - 1) * dilation[1] + 1) + 2 * padding[1]) / stride[1] + 1;
 
-    res = {{inputs_shape[0][0], inputs_shape[1][0], out_shape_h, out_shape_w}};
+    output_shape[n] = inputs_shape[0][n];
+    output_shape[c] = inputs_shape[1][n];
+    output_shape[h] = out_shape_h;
+    output_shape[w] = out_shape_w;
+  } else if (conv_type == "backward_data") {
+    CHECK(attrs.find("output_shape") != attrs.end()) << "The shape of backward_data is not found! Please check.";
+    const auto &x_shape = absl::get<std::vector<int>>(attrs.at("output_shape"));
+    CHECK_EQ(x_shape.size(), 4) << "The rank of x shape is not 4! Please check";
 
+    // input[0] = w(C_out, C_in/group, h, w)
+    // input[1] = dy(batch, C_out, h, w)
+    // output = dx(batch, C_in, h, w)
+    output_shape[n] = inputs_shape[1][n];
+    output_shape[c] = inputs_shape[0][c] * groups;
+    output_shape[h] = x_shape[h];
+    output_shape[w] = x_shape[w];
+  } else if (conv_type == "backward_filter") {
+    CHECK(attrs.find("output_shape") != attrs.end()) << "The shape of backward_filter is not found! Please check.";
+    const auto &weight_shape = absl::get<std::vector<int>>(attrs.at("output_shape"));
+    CHECK_EQ(weight_shape.size(), 4) << "The rank of weight shape is not 4! Please check";
+
+    // input[0] = x(batch, C_in, h, w)
+    // input[1] = dy(batch, C_out, h, w)
+    // output = dw (C_out, C_in/group, h, w)
+    output_shape[n] = inputs_shape[1][c];
+    output_shape[c] = inputs_shape[0][c] / groups;
+    output_shape[h] = weight_shape[h];
+    output_shape[w] = weight_shape[w];
+  }
+
+  std::vector<shape_t> res = {output_shape};
+  if (data_format == "NCHW") {
     absl::flat_hash_map<std::string, int> conv2d_factors;
     int batch       = inputs_shape[0][0];
     int oc          = inputs_shape[1][0];
@@ -557,28 +583,10 @@ std::vector<shape_t> InferShapeForConv2d(const std::vector<shape_t> &inputs_shap
         oc_chunk, fc_chunk, dilation[0] * (h_f - 1) + 1, dilation[1] * (w_f - 1) + 1, fc_bn, oc_bn};
     std::vector<int> data_shape = {batch, ic_chunk, h_in, w_in, ic_bn};
 
-    // output shape
-    std::vector<int> res_shape = {};
-    if (conv_type == "forward") {
-      // x w y
-      res_shape = {batch, oc, out_shape_h, out_shape_w};
-    } else if (conv_type == "backward_data") {
-      // w(C_out, C_in/group, h, w) dy(Batch, C_out, h, w) dx(batch, C_in, h, w)
-      res_shape = {inputs_shape[1][0], inputs_shape[0][1] * groups, out_shape_h, out_shape_w};
-    } else if (conv_type == "backward_filter") {
-      // x(batch, C_in, h, w) dy(batch, C_out, h, w) dw (C_out, C_in/group, h, w)
-      res_shape = {inputs_shape[1][1], inputs_shape[0][1] / groups, out_shape_h, out_shape_w};
-    }
-    return {res_shape, packed_out_shape, weights_dilation_shape, input_pad_shape};
+    res = {output_shape, packed_out_shape, weights_dilation_shape, input_pad_shape};
   } else if (data_format == "NHWC") {
-    // A is input: [N, H, W, C], B is filter: [C_out, C_in/group, filter_h, filter_w]
-    int out_shape_h =
-        (inputs_shape[0][1] - ((inputs_shape[1][2] - 1) * dilation[0] + 1) + 2 * padding[0]) / stride[0] + 1;
-    int out_shape_w =
-        (inputs_shape[0][2] - ((inputs_shape[1][3] - 1) * dilation[1] + 1) + 2 * padding[1]) / stride[1] + 1;
-    res = {{inputs_shape[0][0], out_shape_h, out_shape_w, inputs_shape[1][0]}};
-  } else {
-    LOG(FATAL) << "Only support NCHW and NHWC data layout\n";
+    // now conv2d codegen version only support NCHW data format
+    res = {output_shape};
   }
   return res;
 }
@@ -1068,8 +1076,7 @@ std::shared_ptr<OpStrategy> StrategyForBatchNorm(const framework::NodeAttr &attr
   auto strategy = std::make_shared<framework::OpStrategy>();
   CHECK(out_type.size()) << "Out_type of batchnorm op is empty! Please check.";
   if (out_type[0] == Float(32)) {
-    strategy->AddImpl(
-        batchnorm_compute, framework::GetInjectiveScheduleFunc(output_shapes, target), "strategy.batchnorm.x86", 1);
+    strategy->AddImpl(batchnorm_compute, GetInjectiveScheduleFunc(output_shapes, target), "strategy.batchnorm.x86", 1);
   } else {
     LOG(FATAL) << "BatchNorm op with dtype != float32 is not implemented yet!";
   }
@@ -1084,7 +1091,10 @@ std::vector<shape_t> InferShapeForBatchNorm(const std::vector<shape_t> &inputs_s
 }
 
 std::vector<Type> InferDtypeForBatchNorm(const std::vector<Type> &inputs_type, const framework::AttrMapType &attrs) {
-  CHECK(!inputs_type.empty()) << "The input's type size is 0! Please check again.";
+  CHECK_EQ(inputs_type.size(), 5U) << "The BatchNorm Infer input's type size should be 5! Please check again.";
+  CHECK_EQ(inputs_type[1], inputs_type[2]) << "The BatchNorm Infer scale type should the same as bias type";
+  CHECK_EQ(inputs_type[1], inputs_type[3]) << "The BatchNorm Infer scale type should the same as moving_mean type";
+  CHECK_EQ(inputs_type[1], inputs_type[4]) << "The BatchNorm Infer scale type should the same as moving_variance type";
   std::vector<Type> res{inputs_type[0]};
   return res;
 }
@@ -1140,6 +1150,7 @@ std::shared_ptr<OpStrategy> StrategyForPool1d(const framework::NodeAttr &attrs,
     CHECK(!kernel_size.empty()) << "kernel_size for pool1d is empty. Please check.\n";
     CHECK(!stride_size.empty()) << "stride_size for pool1d is empty. Please check.\n";
     CHECK(!padding_size.empty()) << "padding_size for pool1d is empty. Please check.\n";
+    CHECK(pool_type == "max" || pool_type == "avg") << "pool_type for pool1d should be max or avg.\n";
 
     std::string tensor_name = UniqName("Pool1d_out");
     if (FLAGS_cinn_ir_schedule) {
@@ -1263,6 +1274,7 @@ std::vector<std::vector<int>> InferShapeForPool1d(const std::vector<std::vector<
   CHECK_EQ(kernel_size.size(), 1U) << "kernel size for pool1d should be 1.\n";
   CHECK_EQ(stride_size.size(), 1U) << "stride_size size for pool1d should be 1.\n";
   CHECK_EQ(padding_size.size(), 2U) << "padding_size size for pool1d should be 2.\n";
+  CHECK(pool_type == "max" || pool_type == "avg") << "pool_type for pool1d should be max or avg.\n";
 
   std::vector<int> output_shape1 = inputs_shape[0];
   CHECK_EQ(output_shape1.size(), 3U);
@@ -1328,6 +1340,7 @@ std::shared_ptr<OpStrategy> StrategyForPool2d(const framework::NodeAttr &attrs,
   CHECK(!kernel_size.empty()) << "kernel_size for pool2d is empty. Please check.\n";
   CHECK(!stride_size.empty()) << "stride_size for pool2d is empty. Please check.\n";
   CHECK(!padding_size.empty()) << "padding_size for pool2d is empty. Please check.\n";
+  CHECK(pool_type == "max" || pool_type == "avg") << "pool_type for pool2d should be max or avg.\n";
 
   CHECK(!inputs.empty()) << "The input tensor of pool2d compute is empty! Please check.\n";
   const ir::Tensor &A_tensor = inputs[0];
@@ -1558,26 +1571,25 @@ std::vector<std::vector<int>> InferShapeForPool2d(const std::vector<std::vector<
       data_format = absl::get<std::string>(iter.second);
     } else if (iter.first == "adaptive") {
       adaptive = absl::get<bool>(iter.second);
+    } else if (iter.first == "pool_type") {
+      pool_type = absl::get<std::string>(iter.second);
     }
   }
-  CHECK_EQ(kernel_size.size(), 2U) << "kernel size for pool2d should be 2.\n";
-  CHECK_EQ(stride_size.size(), 2U) << "stride_size size for pool2d should be 2.\n";
 
-  std::vector<int> output_shape1 = inputs_shape[0];
-  int height_axis                = -1;
-  int width_axis                 = -1;
+  CHECK(pool_type == "max" || pool_type == "avg") << "pool_type for pool2d should be max or avg.\n";
+  if (data_format == "AnyLayout") {
+    data_format = "NCHW";
+  }
+  CHECK(data_format == "NCHW" || data_format == "NHWC") << "data_format of pool2d only support NCHW and NHWC.\n";
+
+  int height_axis = -1;
+  int width_axis  = -1;
   if (data_format == "NCHW") {
     height_axis = 2;
     width_axis  = 3;
-  } else if (data_format == "NHWC") {
+  } else {
     height_axis = 1;
     width_axis  = 2;
-  } else if (data_format == "AnyLayout") {
-    height_axis = 2;
-    width_axis  = 3;
-    data_format = "NCHW";
-  } else {
-    LOG(ERROR) << "unsupported data_format: " << data_format << std::endl;
   }
 
   if (global_pooling) {
@@ -1585,6 +1597,16 @@ std::vector<std::vector<int>> InferShapeForPool2d(const std::vector<std::vector<
     padding_size = {0, 0, 0, 0};
   }
 
+  CHECK_EQ(kernel_size.size(), 2U) << "kernel size rank for pool2d should be 2.\n";
+  CHECK(kernel_size[0] > 0 && kernel_size[1] > 0) << "the value of kernel size for pool2d should greater than 0.\n";
+  CHECK_EQ(stride_size.size(), 2U) << "stride_size size for pool2d should be 2.\n";
+  CHECK(stride_size[0] > 0 && stride_size[1] > 0) << "the value of kernel size for pool2d should greater than 0.\n";
+
+  if (padding_size.size() == 2) {
+    padding_size.insert(padding_size.end(), padding_size.begin(), padding_size.end());
+  }
+
+  std::vector<int> output_shape1 = inputs_shape[0];
   if (ceil_mode) {
     output_shape1[height_axis] =
         (inputs_shape[0][height_axis] - kernel_size[0] + padding_size[0] + padding_size[2] + stride_size[0] - 1) /
@@ -1608,6 +1630,13 @@ std::vector<std::vector<int>> InferShapeForPool2d(const std::vector<std::vector<
     output_shape1[height_axis] = kernel_size[0];
     output_shape1[width_axis]  = kernel_size[1];
   }
+
+  VLOG(4) << std::boolalpha << "y[" << cinn::utils::Join(output_shape1, ", ") << "] = pool2d(x["
+          << cinn::utils::Join(inputs_shape[0], ", ") << "], kernel_size=[" << cinn::utils::Join(kernel_size, ", ")
+          << "], stride_size=[" << cinn::utils::Join(stride_size, ", ") << "], padding_size=["
+          << cinn::utils::Join(padding_size, ", ") << "], pool_type=" << pool_type << ", ceil_mode=" << ceil_mode
+          << ", exclusive=" << exclusive << ", data_format=" << data_format << ", global_pooling=" << global_pooling
+          << ", adaptive=" << adaptive;
   std::vector<std::vector<int>> res{output_shape1};
   return res;
 }
@@ -1654,6 +1683,7 @@ std::shared_ptr<OpStrategy> StrategyForPool3d(const framework::NodeAttr &attrs,
     CHECK(!kernel_size.empty()) << "kernel_size for pool3d is empty. Please check.\n";
     CHECK(!stride_size.empty()) << "stride_size for pool3d is empty. Please check.\n";
     CHECK(!padding_size.empty()) << "padding_size for pool3d is empty. Please check.\n";
+    CHECK(pool_type == "max" || pool_type == "avg") << "pool_type for pool3d should be max or avg.\n";
 
     std::string tensor_name = UniqName("Pool3d_out");
     if (FLAGS_cinn_ir_schedule) {
@@ -1779,6 +1809,7 @@ std::vector<std::vector<int>> InferShapeForPool3d(const std::vector<std::vector<
 
   CHECK_EQ(kernel_size.size(), 3U) << "kernel_size for pool3d should be 3.\n";
   CHECK_EQ(stride_size.size(), 3U) << "stride_size for pool3d should be 3.\n";
+  CHECK(pool_type == "max" || pool_type == "avg") << "pool_type for pool3d should be max or avg.\n";
 
   std::vector<int> output_shape1 = inputs_shape[0];
   CHECK_EQ(inputs_shape[0].size(), 5U) << "input_shape size for pool3d should be 5.\n";
@@ -1971,13 +2002,13 @@ std::shared_ptr<OpStrategy> StrategyForSoftmax(const framework::NodeAttr &attrs,
 std::vector<std::vector<int>> InferShapeForSoftmax(const std::vector<std::vector<int>> &inputs_shape,
                                                    const framework::AttrMapType &attrs) {
   CHECK(!inputs_shape.empty() && !inputs_shape[0].empty()) << "The input's shape size is 0! Please check again.";
-  std::vector<std::vector<int>> res{inputs_shape[0], inputs_shape[0]};
+  std::vector<std::vector<int>> res{inputs_shape[0]};
   return res;
 }
 
 std::vector<Type> InferDtypeForSoftmax(const std::vector<Type> &inputs_type, const framework::AttrMapType &attrs) {
   CHECK(!inputs_type.empty()) << "The input's type size is 0! Please check again.";
-  std::vector<Type> res{inputs_type[0], inputs_type[0]};
+  std::vector<Type> res{inputs_type[0]};
   return res;
 }
 
@@ -2028,10 +2059,8 @@ std::shared_ptr<OpStrategy> StrategyForDropoutInfer(const framework::NodeAttr &a
   });
 
   auto strategy = std::make_shared<framework::OpStrategy>();
-  strategy->AddImpl(dropout_infer_compute,
-                    framework::GetInjectiveScheduleFunc(output_shapes, target),
-                    "strategy.dropout_infer.x86",
-                    1);
+  strategy->AddImpl(
+      dropout_infer_compute, GetInjectiveScheduleFunc(output_shapes, target), "strategy.dropout_infer.x86", 1);
 
   return strategy;
 }
@@ -2093,8 +2122,7 @@ std::shared_ptr<OpStrategy> StrategyForSelect(const framework::NodeAttr &attrs,
 
   auto strategy = std::make_shared<framework::OpStrategy>();
   CHECK(out_type.size()) << "Out_type of select op is empty! Please check.";
-  strategy->AddImpl(
-      select_compute, framework::GetInjectiveScheduleFunc(output_shapes, target, false), "strategy.select.x86", 1);
+  strategy->AddImpl(select_compute, GetInjectiveScheduleFunc(output_shapes, target, false), "strategy.select.x86", 1);
   return strategy;
 }
 
@@ -2114,6 +2142,19 @@ std::vector<Type> InferDtypeForSelect(const std::vector<Type> &inputs_type, cons
   CHECK(inputs_type[0].is_bool()) << "The condition tensor type should be bool";
   CHECK_EQ(inputs_type[1], inputs_type[2]) << "The true or false tensor type should be equal";
   std::vector<Type> res{inputs_type[1]};
+  return res;
+}
+
+std::vector<Type> InferDtypeForNorm(const std::vector<Type> &inputs_type, const framework::AttrMapType &attrs) {
+  CHECK(!inputs_type.empty()) << "The input's type size is 0! Please check again.";
+  std::vector<Type> res{inputs_type[0]};
+  return res;
+}
+
+std::vector<framework::shape_t> InferShapeForNorm(const std::vector<framework::shape_t> &inputs_shape,
+                                                  const framework::AttrMapType &attrs) {
+  CHECK(!inputs_shape.empty() && !inputs_shape[0].empty()) << "The input's shape size is 0! Please check again.";
+  std::vector<framework::shape_t> res{inputs_shape[0]};
   return res;
 }
 
@@ -2161,8 +2202,11 @@ std::vector<framework::shape_t> InferShapeForBatchNormTrain(const std::vector<fr
 
 std::vector<Type> InferDtypeForBatchNormTrain(const std::vector<Type> &inputs_type,
                                               const framework::AttrMapType &attrs) {
-  CHECK(!inputs_type.empty()) << "The input's type size is 0! Please check again.";
-  return {inputs_type[0], inputs_type[0], inputs_type[0], inputs_type[0], inputs_type[0]};
+  CHECK_EQ(inputs_type.size(), 5U) << "The BatchNormTrain input's type size should be 5! Please check again.";
+  CHECK_EQ(inputs_type[1], inputs_type[2]) << "The BatchNormTrain scale type should the same as bias type";
+  CHECK_EQ(inputs_type[1], inputs_type[3]) << "The BatchNormTrain scale type should the same as moving_mean type";
+  CHECK_EQ(inputs_type[1], inputs_type[4]) << "The BatchNormTrain scale type should the same as moving_variance type";
+  return {inputs_type[0], inputs_type[1], inputs_type[1], inputs_type[1], inputs_type[1]};
 }
 
 std::shared_ptr<OpStrategy> StrategyForGradOp(const framework::NodeAttr &attrs,
@@ -2209,23 +2253,24 @@ std::vector<framework::shape_t> InferShapeForBatchNormGrad(const std::vector<fra
 
 std::vector<Type> InferDtypeForBatchNormGrad(const std::vector<Type> &inputs_type,
                                              const framework::AttrMapType &attrs) {
-  CHECK(!inputs_type.empty()) << "The input's type size is 0! Please check again.";
-  return {inputs_type[0], inputs_type[0], inputs_type[0]};
+  CHECK_EQ(inputs_type.size(), 5U) << "The BatchNormGrad input's type size should be 5! Please check again.";
+
+  CHECK_EQ(inputs_type[0], inputs_type[1]) << "The BatchNormGrad y_grad type should the same as x type";
+  CHECK_EQ(inputs_type[2], inputs_type[3]) << "The BatchNormGrad scale type should the same as save_mean type";
+  CHECK_EQ(inputs_type[2], inputs_type[4]) << "The BatchNormGrad scale type should the same as save_variance type";
+  return {inputs_type[0], inputs_type[2], inputs_type[2]};
 }
 
-// conv2d grad
-std::vector<framework::shape_t> InferShapeForConv2dGrad(const std::vector<framework::shape_t> &inputs_shape,
+// pool2d grad
+std::vector<framework::shape_t> InferShapeForPool2dGrad(const std::vector<framework::shape_t> &inputs_shape,
                                                         const framework::AttrMapType &attrs) {
-  CHECK_EQ(inputs_shape.size(), 3U) << "The input's layout size is not 3! Please check again.";
-  CHECK_EQ(inputs_shape[0].size(), 4U) << "Dy shape is not 4, Please check again.";
-  CHECK_EQ(inputs_shape[1].size(), 4U) << "Dy shape is not 4, Please check again.";
-  CHECK_EQ(inputs_shape[2].size(), 4U) << "Dy shape is not 4, Please check again.";
-  return {inputs_shape[1], inputs_shape[2]};
+  CHECK_EQ(inputs_shape.size(), 3U) << "The operator pool2d_grad should has 3 inputs! Please check again.";
+  return {inputs_shape[0]};
 }
 
-std::vector<Type> InferDtypeForConv2dGrad(const std::vector<Type> &inputs_type, const framework::AttrMapType &attrs) {
-  CHECK(!inputs_type.empty()) << "The input's type size is 0! Please check again.";
-  return {inputs_type[0], inputs_type[0]};
+std::vector<Type> InferDtypeForPool2dGrad(const std::vector<Type> &inputs_type, const framework::AttrMapType &attrs) {
+  CHECK_EQ(inputs_type.size(), 3U) << "The operator pool2d_grad should has 3 inputs! Please check again.";
+  return {inputs_type[0]};
 }
 
 }  // namespace op
@@ -2357,7 +2402,7 @@ CINN_REGISTER_HELPER(nn_ops) {
   CINN_REGISTER_OP(softmax)
       .describe("This operator implements the softmax layer")
       .set_num_inputs(1)
-      .set_num_outputs(2)
+      .set_num_outputs(1)
       .set_attr<cinn::hlir::framework::StrategyFunction>("CINNStrategy", cinn::hlir::op::StrategyForSoftmax)
       .set_attr("infershape", MakeOpFunction(cinn::hlir::op::InferShapeForSoftmax))
       .set_attr("inferdtype", MakeOpFunction(cinn::hlir::op::InferDtypeForSoftmax))
@@ -2393,6 +2438,15 @@ CINN_REGISTER_HELPER(nn_ops) {
       .set_attr<cinn::hlir::framework::OpPatternKind>("OpPattern", cinn::hlir::framework::OpPatternKind::kElementWise)
       .set_support_level(4);
 
+  CINN_REGISTER_OP(norm)
+      .describe("Norm.")
+      .set_num_inputs(1)
+      .set_num_outputs(1)
+      .set_attr("infershape", MakeOpFunction(cinn::hlir::op::InferShapeForNorm))
+      .set_attr("inferdtype", MakeOpFunction(cinn::hlir::op::InferDtypeForNorm))
+      .set_attr<cinn::hlir::framework::OpPatternKind>("OpPattern", cinn::hlir::framework::OpPatternKind::kNonFusible)
+      .set_support_level(4);
+
   return true;
 }
 
@@ -2422,12 +2476,12 @@ CINN_REGISTER_HELPER(nn_grad_ops) {
       .set_attr("inferdtype", MakeOpFunction(cinn::hlir::op::InferDtypeForBatchNormGrad))
       .set_support_level(4);
 
-  CINN_REGISTER_OP(conv2d_grad)
-      .describe("This operator implements the convolution backward.")
+  CINN_REGISTER_OP(pool2d_grad)
+      .describe("This operator implements the batch normalization backward.")
       .set_num_inputs(3)
-      .set_num_outputs(2)
-      .set_attr("infershape", MakeOpFunction(cinn::hlir::op::InferShapeForConv2dGrad))
-      .set_attr("inferdtype", MakeOpFunction(cinn::hlir::op::InferDtypeForConv2dGrad))
+      .set_num_outputs(1)
+      .set_attr("infershape", MakeOpFunction(cinn::hlir::op::InferShapeForPool2dGrad))
+      .set_attr("inferdtype", MakeOpFunction(cinn::hlir::op::InferDtypeForPool2dGrad))
       .set_support_level(4);
 
   return true;

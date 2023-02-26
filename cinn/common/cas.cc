@@ -711,8 +711,7 @@ std::vector<Expr> CasSimplifyMutator::SimplifyBinarySum(Expr left, Expr right) {
       VLOG(7) << "a " << a;
       VLOG(7) << "b " << b;
       Expr s = SimplifySum(Sum::Make({ProductGetConstantPart(a), ProductGetConstantPart(b)}));
-      Expr p = Product::Make({ir::Cast::Make(a->type(), s), ProductGetNonConstantPart(a)});
-      optim::CastSimplify(&p);
+      Expr p = Product::Make({s, ProductGetNonConstantPart(a)});
       return {CasSimplify(p, var_intervals)};
     }
 
@@ -1989,7 +1988,7 @@ Expr CasSimplifyMutator::SimplifyFracOp(Expr expr) {
           if (b_d != 1) bvs1.push_back(make_const(b.type(), b_d));
         }
 
-        CHECK(!af);
+        // CHECK(!af) << a << " " << b;
         i++;
         j++;
       } else if (avs[i] == bvs[j]) {

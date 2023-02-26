@@ -24,6 +24,7 @@
 namespace cinn {
 namespace hlir {
 namespace pe {
+
 /**
  * @brief Unary primitive emitters
  *
@@ -75,6 +76,9 @@ HLIR_DCL_UNARY_PE(Reinterpret);
 HLIR_DCL_UNARY_PE(ElementwiseSum);
 HLIR_DCL_UNARY_PE(Full);
 HLIR_DCL_UNARY_PE(FullLike);
+HLIR_DCL_UNARY_PE(Cbrt);
+HLIR_DCL_UNARY_PE(Clz);
+HLIR_DCL_UNARY_PE(Popc);
 
 template <typename T>
 ir::Tensor AssignValue(const std::vector<T>& values,
@@ -99,6 +103,27 @@ ir::Tensor AssignValue(const std::vector<T>& values,
 
   return out;
 }
+
+ir::Tensor Squeeze(const ir::Tensor& A,
+                   const std::vector<int>& axes   = {},
+                   const std::string& output_name = UniqName("T_Elementwise_Squeeze_out"));
+
+ir::Tensor ExpandDims(const ir::Tensor& A,
+                      const std::vector<int>& axes,
+                      const std::vector<int>& out_shape,
+                      const std::string& output_name = UniqName("T_Elementwise_ExpandDims_out"));
+
+ir::Tensor Reshape(const ir::Tensor& A,
+                   const std::vector<int>& new_shape,
+                   const std::string& name = UniqName("T_Elementwise_Reshape_out"));
+
+ir::Tensor Cast(const ir::Tensor& A, const Type& dtype, const std::string& name = UniqName("T_Elementwise_Cast_out"));
+
+ir::Tensor Arange(const float start,
+                  const float stop,
+                  const float step,
+                  const Type& dtype,
+                  const std::string& name = UniqName("T_Elementwise_Arange_out"));
 
 }  // namespace pe
 }  // namespace hlir

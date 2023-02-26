@@ -28,7 +28,6 @@
 #include "cinn/hlir/framework/graph_compiler.h"
 #include "cinn/hlir/framework/node.h"
 #include "cinn/hlir/framework/pass.h"
-#include "cinn/hlir/pass/op_fusion_pass.h"
 #include "cinn/ir/ir_base.h"
 #include "cinn/runtime/flags.h"
 #include "cinn/utils/data_util.h"
@@ -57,7 +56,7 @@ class PerformanceTester : public ::testing::Test {
     // times of compiled runtime program will be executed repeatedly.
     int repeat_times = 2;
     // the num_tuning_rounds for auto tuning
-    int num_tuning_rounds = 1;
+    int num_tuning_rounds = 2;
     // knobs to control which schedules will be measured, refer to FLAGS_evaluate_knobs explanation
     std::bitset<3> evaluate_knobs = 7UL;
   };
@@ -110,10 +109,9 @@ class PerformanceTester : public ::testing::Test {
     compile_options.with_instantiate_variables = true;
 
     if (graph->fusion_groups.empty()) {
-      compile_options.groups = hlir::pass::BuildNonFusedGroups(graph);
-    } else {
-      compile_options.groups = graph->fusion_groups;
+      hlir::framework::ApplyPasses(graph, {"BuildNonFusedGroupsPass"});
     }
+    compile_options.groups = graph->fusion_groups;
 
     for (auto group : graph->fusion_groups) {
       compile_options.lowered_funcs.push_back(op_lowerer->LowerWithoutSchedule(group));
@@ -255,10 +253,9 @@ TEST_F(PerformanceTester, Reshape) {
 
 TEST_F(PerformanceTester, Softmax) {
   std::vector<int32_t> input_shape{batch_size, 1000};
-  int axis                = -1;
-  std::string data_format = "AnyLayout";
+  int axis = -1;
 
-  Evaluate(SoftmaxProgramBuilder(input_shape, axis, data_format)());
+  Evaluate(SoftmaxProgramBuilder(input_shape, {axis})());
 }
 
 TEST_F(PerformanceTester, Scale) {
@@ -268,6 +265,20 @@ TEST_F(PerformanceTester, Scale) {
   bool bias_after_scale = true;
 
   Evaluate(ScaleProgramBuilder(input_shape, scale, bias, bias_after_scale)());
+}
+
+TEST_F(PerformanceTester, LookupTable) {
+  std::vector<int32_t> table_shape{50001, 768};
+  std::vector<int32_t> ids_shape{10, 128, 1};
+
+  Evaluate(LookupTableProgramBuilder(table_shape, ids_shape, -1)());
+}
+
+TEST_F(PerformanceTester, Gather) {
+  std::vector<int32_t> operand_shape{10, 12, 128, 512};
+  std::vector<int32_t> index_shape{128};
+
+  Evaluate(GatherProgramBuilder(operand_shape, index_shape, 3)());
 }
 
 // paddle model test

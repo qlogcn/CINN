@@ -31,6 +31,10 @@ namespace cinn {
 namespace hlir {
 namespace pe {
 
+void IRElementwiseSchedule(ir::IRSchedule &ir_sch, const std::vector<int> &output_shape, const common::Target &target);
+
+void IRInjectiveSchedule(ir::IRSchedule &ir_sch, const std::vector<int> &output_shape, const common::Target &target);
+
 void IRScheduleInjectiveCPU(ir::IRSchedule &ir_sch,
                             const std::vector<int> &output_shape,
                             const common::Target &target,
@@ -39,6 +43,10 @@ void IRScheduleInjectiveCPU(ir::IRSchedule &ir_sch,
 void IRCudaScheduleInjective(ir::IRSchedule &ir_sch,
                              const std::vector<int> &output_shape,
                              const common::Target &target);
+
+std::vector<common::CINNValue> IRCudaScheduleMatMul(const common::CINNValuePack &arg_pack,
+                                                    const std::vector<int> &output_shape,
+                                                    const common::Target &target);
 
 void IRCudaScheduleMul(ir::IRSchedule &ir_sch, const std::vector<int> &output_shape, const common::Target &target);
 

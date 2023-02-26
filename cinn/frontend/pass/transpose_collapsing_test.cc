@@ -49,7 +49,11 @@ std::vector<std::vector<float>> RunWithProgram(const Program& program,
                                                const Target& target,
                                                const std::vector<std::string>& input_names,
                                                const std::vector<std::string>& out_ids) {
-  auto graph = std::make_shared<hlir::framework::Graph>(program, target);
+  std::unordered_set<std::string> fetch_list;
+  for (auto id : out_ids) {
+    fetch_list.insert(id);
+  }
+  auto graph = std::make_shared<hlir::framework::Graph>(program, fetch_list, target);
   auto scope = hlir::framework::BuildScope(target, graph);
 
   for (const auto& in_name : input_names) {
@@ -395,7 +399,7 @@ TEST(TransposeCollapsing, FuseTwoHorizontalTranspose) {
 
   auto folded_out = RunWithProgram(program, target, {"X"}, fetch_list);
 
-  ASSERT_EQ(origin_size, folded_size + 1);
+  ASSERT_EQ(origin_size - folded_size, 0);
   ASSERT_EQ(origin_out.size(), folded_out.size());
   for (size_t i = 0; i < origin_out.size(); ++i) {
     ASSERT_EQ(origin_out[i].size(), folded_out[i].size());
@@ -438,7 +442,7 @@ TEST(TransposeCollapsing, FuseVerAndHorTranspose) {
 
   auto folded_out = RunWithProgram(program, target, {"X"}, fetch_list);
 
-  ASSERT_EQ(origin_size, folded_size + 2);
+  ASSERT_EQ(origin_size - folded_size, 1);
   ASSERT_EQ(origin_out.size(), folded_out.size());
   for (size_t i = 0; i < origin_out.size(); ++i) {
     ASSERT_EQ(origin_out[i].size(), folded_out[i].size());

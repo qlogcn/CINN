@@ -179,6 +179,27 @@ TEST_F(TestScheduleDesc, StepKind_GetAllBlocks) {
   CheckTracingOutputs(all_blocks, ir_sch.GetTraceDesc());
 }
 
+TEST_F(TestScheduleDesc, StepKind_GetChildBlocks) {
+  lowered_funcs         = LowerCompute({32, 32, 64}, target, true);
+  ir::IRSchedule ir_sch = MakeIRSchedule(lowered_funcs);
+
+  auto block_b = ir_sch.GetBlock("B");
+  trace.Append(ScheduleDesc::Step("GetBlock", {}, {{"block_name", std::string("B")}}, {block_b}));
+  auto loops = ir_sch.GetLoops("C");
+  trace.Append(ScheduleDesc::Step("GetLoopsWithName", {}, {{"block_name", std::string("C")}}, loops));
+  ir_sch.ComputeAt(block_b, loops[1]);
+  trace.Append(ScheduleDesc::Step(
+      "ComputeAt", {{"block", std::vector<Expr>({block_b})}, {"loop", std::vector<Expr>({loops[1]})}}, {}, {}));
+  loops = ir_sch.GetLoops("B");
+  trace.Append(ScheduleDesc::Step("GetLoopsWithName", {}, {{"block_name", std::string("B")}}, loops));
+  auto root_block = ir_sch.GetRootBlock(loops[1]);
+  trace.Append(ScheduleDesc::Step("GetRootBlock", {{"expr", std::vector<Expr>({loops[1]})}}, {}, {root_block}));
+  auto childblocks = ir_sch.GetChildBlocks(root_block);
+  trace.Append(ScheduleDesc::Step("GetChildBlocks", {{"expr", std::vector<Expr>({root_block})}}, {}, childblocks));
+  CheckTracingOutputs(childblocks, trace);
+  CheckTracingOutputs(childblocks, ir_sch.GetTraceDesc());
+}
+
 TEST_F(TestScheduleDesc, StepKind_GetLoops) {
   lowered_funcs         = LowerCompute({32, 32}, target);
   ir::IRSchedule ir_sch = MakeIRSchedule(lowered_funcs);
@@ -306,6 +327,21 @@ TEST_F(TestScheduleDesc, StepKind_SimpleComputeAt) {
   CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
 }
 
+TEST_F(TestScheduleDesc, StepKind_ReverseComputeAt) {
+  lowered_funcs         = LowerCompute({32, 32, 64}, target, true);
+  ir::IRSchedule ir_sch = MakeIRSchedule(lowered_funcs);
+
+  auto block_c = ir_sch.GetBlock("C");
+  trace.Append(ScheduleDesc::Step("GetBlock", {}, {{"block_name", std::string("C")}}, {block_c}));
+  auto loops = ir_sch.GetLoops("B");
+  trace.Append(ScheduleDesc::Step("GetLoopsWithName", {}, {{"block_name", std::string("B")}}, loops));
+  ir_sch.ReverseComputeAt(block_c, loops[1]);
+  trace.Append(ScheduleDesc::Step(
+      "ReverseComputeAt", {{"block", std::vector<Expr>({block_c})}, {"loop", std::vector<Expr>({loops[1]})}}, {}, {}));
+  CheckReplayResult(ir_sch, trace);
+  CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
+}
+
 TEST_F(TestScheduleDesc, StepKind_GetRootBlock) {
   lowered_funcs         = LowerCompute({32, 64}, target);
   ir::IRSchedule ir_sch = MakeIRSchedule(lowered_funcs);
@@ -419,8 +455,8 @@ TEST_F(TestScheduleDesc, StepKind_Reorder) {
 
   auto loops = ir_sch.GetLoops("B");
   trace.Append(ScheduleDesc::Step("GetLoopsWithName", {}, {{"block_name", std::string("B")}}, loops));
-  ir_sch.Reorder({loops[4], loops[0]});
-  trace.Append(ScheduleDesc::Step("Reorder", {{"loops", std::vector<Expr>({loops[4], loops[0]})}}, {}, {}));
+  Expr ret = ir_sch.Reorder({loops[4], loops[0]});
+  trace.Append(ScheduleDesc::Step("Reorder", {{"loops", std::vector<Expr>({loops[4], loops[0]})}}, {}, {ret}));
   CheckReplayResult(ir_sch, trace);
   CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
 }
@@ -443,11 +479,11 @@ TEST_F(TestScheduleDesc, StepKind_ReorderWithBlock) {
 
   auto block_b = ir_sch.GetBlock("B");
   trace.Append(ScheduleDesc::Step("GetBlock", {}, {{"block_name", std::string("B")}}, {block_b}));
-  ir_sch.Reorder("B", {2, 3, 1, 4, 0});
+  Expr ret = ir_sch.Reorder("B", {2, 3, 1, 4, 0});
   trace.Append(ScheduleDesc::Step("ReorderWithBlock",
                                   {{"block", std::vector<Expr>({block_b})}},
                                   {{"loops_index", std::vector<int>({2, 3, 1, 4, 0})}},
-                                  {}));
+                                  {ret}));
   CheckReplayResult(ir_sch, trace);
   CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
 }
@@ -468,12 +504,12 @@ TEST_F(TestScheduleDesc, StepKind_ReorderWithName) {
                          {{"block_name", std::string("B")}, {"loop_index", 2}, {"factors", std::vector<int>({-1, 2})}},
                          splited));
 
-  ir_sch.Reorder("B", {4, 2, 3, 1, 0});
+  Expr ret = ir_sch.Reorder("B", {4, 2, 3, 1, 0});
   trace.Append(
       ScheduleDesc::Step("ReorderWithName",
                          {},
                          {{"block_name", std::string("B")}, {"loops_index", std::vector<int>({4, 2, 3, 1, 0})}},
-                         {}));
+                         {ret}));
   CheckReplayResult(ir_sch, trace);
   CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
 }
@@ -622,6 +658,66 @@ TEST_F(TestScheduleDesc, StepKind_Annotate) {
                                   {{"key", std::string("k4")}, {"value", std::string("v4")}},
                                   {}));
 
+  CheckReplayResult(ir_sch, trace);
+  CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
+}
+
+TEST_F(TestScheduleDesc, StepKind_Unannotate) {
+  lowered_funcs         = LowerCompute({32, 128}, target);
+  ir::IRSchedule ir_sch = MakeIRSchedule(lowered_funcs);
+
+  auto block_b = ir_sch.GetBlock("B");
+  trace.Append(ScheduleDesc::Step("GetBlock", {}, {{"block_name", std::string("B")}}, {block_b}));
+  ir_sch.Annotate(block_b, "k1", int(64));
+  trace.Append(ScheduleDesc::Step("AnnotateIntAttr",
+                                  {{"block", std::vector<Expr>({block_b})}},
+                                  {{"key", std::string("k1")}, {"value", int(64)}},
+                                  {}));
+
+  block_b = ir_sch.GetBlock("B");
+  trace.Append(ScheduleDesc::Step("GetBlock", {}, {{"block_name", std::string("B")}}, {block_b}));
+  ir_sch.Annotate(block_b, "k2", bool(true));
+  trace.Append(ScheduleDesc::Step("AnnotateBoolAttr",
+                                  {{"block", std::vector<Expr>({block_b})}},
+                                  {{"key", std::string("k2")}, {"value", bool(true)}},
+                                  {}));
+
+  block_b = ir_sch.GetBlock("B");
+  trace.Append(ScheduleDesc::Step("GetBlock", {}, {{"block_name", std::string("B")}}, {block_b}));
+  ir_sch.Unannotate(block_b, "k1");
+  trace.Append(
+      ScheduleDesc::Step("Unannotate", {{"block", std::vector<Expr>({block_b})}}, {{"key", std::string("k1")}}, {}));
+
+  block_b = ir_sch.GetBlock("B");
+  trace.Append(ScheduleDesc::Step("GetBlock", {}, {{"block_name", std::string("B")}}, {block_b}));
+  ir_sch.Unannotate(block_b, "k2");
+  trace.Append(
+      ScheduleDesc::Step("Unannotate", {{"block", std::vector<Expr>({block_b})}}, {{"key", std::string("k2")}}, {}));
+
+  CheckReplayResult(ir_sch, trace);
+  CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
+}
+
+TEST_F(TestScheduleDesc, StepKind_SamplePerfectTile) {
+  Expr M(1024);
+  Var n(1, "n");
+
+  Placeholder<int> A("A", {M});
+  auto B = Compute(
+      {M}, [&](Expr i) { return A(i) + n; }, "B");
+  lowered_funcs =
+      cinn::lang::LowerVec("test_sample_perfect_tile", CreateStages({A, B}), {A, B}, {}, {}, nullptr, target, true);
+
+  ir::IRSchedule ir_sch = MakeIRSchedule(lowered_funcs);
+  auto loops            = ir_sch.GetLoops("B");
+  trace.Append(ScheduleDesc::Step("GetLoopsWithName", {}, {{"block_name", std::string("B")}}, loops));
+  auto result = ir_sch.SamplePerfectTile(loops[0], 2, 64);
+  trace.Append(ScheduleDesc::Step("SamplePerfectTile",
+                                  {{"loop", std::vector<Expr>({loops[0]})}},
+                                  {{"n", 2}, {"max_innermost_factor", 64}},
+                                  result));
+  CheckTracingOutputs(result, trace);
+  CheckTracingOutputs(result, ir_sch.GetTraceDesc());
   CheckReplayResult(ir_sch, trace);
   CheckReplayResult(ir_sch, ir_sch.GetTraceDesc());
 }

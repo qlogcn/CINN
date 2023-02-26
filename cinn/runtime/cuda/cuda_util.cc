@@ -17,7 +17,10 @@
 #include <absl/container/flat_hash_map.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <curand.h>
+#include <cusolverDn.h>
 #include <glog/logging.h>
+#include <thrust/device_vector.h>
 
 #include <algorithm>
 #ifdef CINN_WITH_CUDNN
@@ -27,6 +30,7 @@
 #include "cinn/backends/cuda_util.h"
 #include "cinn/backends/extern_func_jit_register.h"
 #include "cinn/common/target.h"
+#include "cinn/runtime/cuda/cublas_util.h"
 #include "cinn/runtime/flags.h"
 #include "cinn/utils/timer.h"
 
@@ -38,15 +42,32 @@ class CublasHandle {
  public:
   CublasHandle(const CublasHandle &) = delete;
   CublasHandle &operator=(const CublasHandle &) = delete;
-  ~CublasHandle() { CUBLAS_CALL(cublasDestroy(cuhandle)); }
+  ~CublasHandle() {
+    CUBLAS_CALL(cublasDestroy(cuhandle));
+    CUDA_CALL(cudaStreamDestroy(custream));
+  }
   static CublasHandle &GetInstance() {
     static CublasHandle instance;
     return instance;
   }
+  cudaStream_t GetCuStream() { return custream; }
   cublasHandle_t &GetCublasHandle() { return cuhandle; }
 
  private:
-  CublasHandle() { CUBLAS_CALL(cublasCreate(&cuhandle)); }
+  CublasHandle() {
+    CUDA_CALL(cudaStreamCreate(&custream));
+    CUBLAS_CALL(cublasCreate(&cuhandle));
+    cudaMemPool_t mem_pool;
+    CUDA_CALL(cudaDeviceGetMemPool(&mem_pool, 0));
+
+    uint64_t threshold = UINT32_MAX;
+    CUDA_CALL(cudaMemPoolSetAttribute(mem_pool, cudaMemPoolAttrReleaseThreshold, &threshold));
+
+    int enable = 1;
+    CUDA_CALL(cudaMemPoolSetAttribute(mem_pool, cudaMemPoolReuseFollowEventDependencies, &enable));
+    CUDA_CALL(cudaMemPoolSetAttribute(mem_pool, cudaMemPoolReuseAllowInternalDependencies, &enable));
+  }
+  cudaStream_t custream;
   cublasHandle_t cuhandle;
 };
 
@@ -64,12 +85,13 @@ void cinn_call_cuda_kernel(void *kernel_fn,
           << block_x << ", " << block_y << ", " << block_z << "}, num_args=" << num_args << ", stream=" << stream;
 
   std::vector<void *> kernel_args;
+  kernel_args.reserve(num_args);
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
   for (int idx = 0; idx < num_args; ++idx) {
     if (args[idx].type_code() == ::cinn_type_code<cinn_buffer_t *>()) {
-      kernel_args.push_back(&((cinn_buffer_t *)(args[idx]))->memory);
+      kernel_args.emplace_back(&((cinn_buffer_t *)(args[idx]))->memory);
     } else {
-      kernel_args.push_back(args[idx].data_addr());
+      kernel_args.emplace_back(args[idx].data_addr());
     }
   }
   CUDA_DRIVER_CALL(cuLaunchKernel(static_cast<CUfunction>(kernel_fn),
@@ -107,9 +129,9 @@ void cinn_call_cublas(void *v_args,
   cudaStream_t custream    = static_cast<cudaStream_t>(stream);
   CUBLAS_CALL(cublasSetStream(cuhandle, custream));
 
-  float *A = reinterpret_cast<float *>(args[0].operator cinn_buffer_t *()->memory);
-  float *B = reinterpret_cast<float *>(args[1].operator cinn_buffer_t *()->memory);
-  float *C = reinterpret_cast<float *>(args[2].operator cinn_buffer_t *()->memory);
+  void *A = args[0].operator cinn_buffer_t *()->memory;
+  void *B = args[1].operator cinn_buffer_t *()->memory;
+  void *C = args[2].operator cinn_buffer_t *()->memory;
 
   int m = trans_o ? (trans_a ? a4 : a3) : (trans_b ? b3 : b4);
   int n = trans_o ? (trans_b ? b3 : b4) : (trans_a ? a4 : a3);
@@ -123,34 +145,48 @@ void cinn_call_cublas(void *v_args,
   int ldr = trans_op_r == CUBLAS_OP_N ? k : n;  // trans_o ? (trans_b ? n : k) : (trans_a ? n : k);
   int ldc = m;
 
-  float *lhs = trans_o ? A : B;
-  float *rhs = trans_o ? B : A;
+  void *lhs = trans_o ? A : B;
+  void *rhs = trans_o ? B : A;
+
+  cudaDataType_t cuda_dtype;
+  auto type_code = args[0].operator cinn_buffer_t *()->type.code;
+  bool is_float  = type_code == cinn_type_float;
+  int bytes      = args[0].operator cinn_buffer_t *()->type.bits / CHAR_BIT;
+  if (is_float && bytes == sizeof(common::float16)) {
+    cuda_dtype = CUDA_R_16F;
+  } else if (is_float && bytes == sizeof(float)) {
+    cuda_dtype = CUDA_R_32F;
+  } else {
+    LOG(FATAL) << "unsupported cublas data type: " << static_cast<int>(type_code) << ", bytes = " << bytes;
+  }
 
   if (a1 * a2 * b1 * b2 == 1) {
-    CUBLAS_CALL(cublasSgemm(cuhandle, trans_op_l, trans_op_r, m, n, k, &alpha, lhs, ldl, rhs, ldr, &beta, C, ldc));
+    CUBLAS_CALL(
+        cublasGemm(cuda_dtype, cuhandle, trans_op_l, trans_op_r, m, n, k, alpha, lhs, ldl, rhs, ldr, beta, C, ldc));
   } else if (a1 * b1 == 1) {
     CHECK(a2 == b2 || a2 == 1 || b2 == 1);
     int stride_l = trans_o ? (a2 > 1 ? a3 * a4 : 0) : (b2 > 1 ? b3 * b4 : 0);
     int stride_r = trans_o ? (b2 > 1 ? b3 * b4 : 0) : (a2 > 1 ? a3 * a4 : 0);
     int batch    = std::max(a2, b2);
-    CUBLAS_CALL(cublasSgemmStridedBatched(cuhandle,
-                                          trans_op_l,
-                                          trans_op_r,
-                                          m,
-                                          n,
-                                          k,
-                                          &alpha,
-                                          lhs,
-                                          ldl,
-                                          stride_l,
-                                          rhs,
-                                          ldr,
-                                          stride_r,
-                                          &beta,
-                                          C,
-                                          ldc,
-                                          m * n,
-                                          batch));
+    CUBLAS_CALL(cublasGemmStridedBatched(cuda_dtype,
+                                         cuhandle,
+                                         trans_op_l,
+                                         trans_op_r,
+                                         m,
+                                         n,
+                                         k,
+                                         alpha,
+                                         lhs,
+                                         ldl,
+                                         stride_l,
+                                         rhs,
+                                         ldr,
+                                         stride_r,
+                                         beta,
+                                         C,
+                                         ldc,
+                                         m * n,
+                                         batch));
   } else {
     int l1 = trans_o ? a1 : b1, l2 = trans_o ? a2 : b2, l3 = trans_o ? a3 : b3, l4 = trans_o ? a4 : b4;
     int r1 = trans_o ? b1 : a1, r2 = trans_o ? b2 : a2, r3 = trans_o ? b3 : a3, r4 = trans_o ? b4 : a4;
@@ -162,24 +198,25 @@ void cinn_call_cublas(void *v_args,
       // four types matmul:
       // (N, L) * (N, L) , (N, 1) * (N, 1)
       // (N, L) * (1, 1) , (1, 1) * (N, L)
-      CUBLAS_CALL(cublasSgemmStridedBatched(cuhandle,
-                                            trans_op_l,
-                                            trans_op_r,
-                                            m,
-                                            n,
-                                            k,
-                                            &alpha,
-                                            lhs,
-                                            ldl,
-                                            stride_l,
-                                            rhs,
-                                            ldr,
-                                            stride_r,
-                                            &beta,
-                                            C,
-                                            ldc,
-                                            m * n,
-                                            std::max(l1, r1) * std::max(l2, r2)));
+      CUBLAS_CALL(cublasGemmStridedBatched(cuda_dtype,
+                                           cuhandle,
+                                           trans_op_l,
+                                           trans_op_r,
+                                           m,
+                                           n,
+                                           k,
+                                           alpha,
+                                           lhs,
+                                           ldl,
+                                           stride_l,
+                                           rhs,
+                                           ldr,
+                                           stride_r,
+                                           beta,
+                                           C,
+                                           ldc,
+                                           m * n,
+                                           std::max(l1, r1) * std::max(l2, r2)));
     } else {
       // (N, L) / (N, 1) / (1, L)
       int bstride_l = (l1 != 1 && l2 != 1) ? (l2 * m * k) : ((l1 != 1) ? m * k : 0);
@@ -193,28 +230,168 @@ void cinn_call_cublas(void *v_args,
       // (N, L) * (N, 1) , (N, L) * (1, L)
       // (N, 1) * (N, L) , (1, L) * (N, L)
       // (N, 1) * (1, L) , (1, L) * (N, 1)
-      for (int idx = 0; idx < std::max(l1, r1); ++idx) {
-        CUBLAS_CALL(cublasSgemmStridedBatched(cuhandle,
-                                              trans_op_l,
-                                              trans_op_r,
-                                              m,
-                                              n,
-                                              k,
-                                              &alpha,
-                                              lhs + idx * bstride_l,
-                                              ldl,
-                                              stride_l,
-                                              rhs + idx * bstride_r,
-                                              ldr,
-                                              stride_r,
-                                              &beta,
-                                              C + idx * bstride_c,
-                                              ldc,
-                                              m * n,
-                                              std::max(l2, r2)));
+
+      void **ptr_arr        = nullptr;
+      cudaStream_t g_stream = CublasHandle::GetInstance().GetCuStream();
+      CUDA_CALL(cudaMallocAsync(&ptr_arr, sizeof(void *) * 3 * std::max(l1, r1) * std::max(l2, r2), g_stream));
+
+      std::vector<void *> ptr(3 * std::max(l1, r1) * std::max(l2, r2));
+      void **ptr_a = ptr.data();
+      void **ptr_b = ptr.data() + std::max(l1, r1) * std::max(l2, r2);
+      void **ptr_c = ptr.data() + std::max(l1, r1) * std::max(l2, r2) * 2;
+
+      for (int idx = 0, index = 0; idx < std::max(l1, r1); ++idx) {
+        for (int idy = 0; idy < std::max(l2, r2); ++idy) {
+          ptr_a[index] = reinterpret_cast<uint8_t *>(lhs) + (idx * bstride_l + idy * stride_l) * bytes;
+          ptr_b[index] = reinterpret_cast<uint8_t *>(rhs) + (idx * bstride_r + idy * stride_r) * bytes;
+          ptr_c[index] = reinterpret_cast<uint8_t *>(C) + (idx * bstride_c + idy * m * n) * bytes;
+          ++index;
+        }
+      }
+      CUDA_CALL(cudaMemcpyAsync(ptr_arr, ptr.data(), ptr.size() * sizeof(void *), cudaMemcpyHostToDevice, g_stream));
+      CUDA_CALL(cudaStreamSynchronize(g_stream));
+
+      CUBLAS_CALL(cublasGemmBatched(cuda_dtype,
+                                    cuhandle,
+                                    trans_op_l,
+                                    trans_op_r,
+                                    m,
+                                    n,
+                                    k,
+                                    alpha,
+                                    ptr_arr,
+                                    ldl,
+                                    ptr_arr + std::max(l1, r1) * std::max(l2, r2),
+                                    ldr,
+                                    beta,
+                                    ptr_arr + std::max(l1, r1) * std::max(l2, r2) * 2,
+                                    ldc,
+                                    std::max(l1, r1) * std::max(l2, r2)));
+      CUDA_CALL(cudaFreeAsync(ptr_arr, custream));
+    }
+  }
+}
+
+void cinn_call_batched_cublas(void *v_args,
+                              int num_args,
+                              int opside,
+                              bool trans_a,
+                              bool trans_b,
+                              bool trans_o,
+                              float alpha,
+                              float beta,
+                              int a1,
+                              int a2,
+                              int a3,
+                              int a4,
+                              int b1,
+                              int b2,
+                              int b3,
+                              int b4,
+                              void *stream) {
+  // A * [B, C, D, ...] or [B, C, D, ...] * A
+  CHECK_EQ((num_args - 1) % 2, 0);
+  cublasHandle_t &cuhandle = CublasHandle::GetInstance().GetCublasHandle();
+  cinn_pod_value_t *args   = static_cast<cinn_pod_value_t *>(v_args);
+  cudaStream_t custream    = static_cast<cudaStream_t>(stream);
+  CUBLAS_CALL(cublasSetStream(cuhandle, custream));
+
+  cudaDataType_t cuda_dtype;
+  auto type_code = args[0].operator cinn_buffer_t *()->type.code;
+  bool is_float  = type_code == cinn_type_float;
+  int bytes      = args[0].operator cinn_buffer_t *()->type.bits / CHAR_BIT;
+  if (is_float && bytes == sizeof(common::float16)) {
+    cuda_dtype = CUDA_R_16F;
+  } else if (is_float && bytes == sizeof(float)) {
+    cuda_dtype = CUDA_R_32F;
+  } else {
+    LOG(FATAL) << "unsupported cublas data type: " << static_cast<int>(type_code) << ", bytes = " << bytes;
+  }
+
+  int m = trans_o ? (trans_a ? a4 : a3) : (trans_b ? b3 : b4);
+  int n = trans_o ? (trans_b ? b3 : b4) : (trans_a ? a4 : a3);
+  int k = trans_a ? a3 : a4;
+
+  cublasOperation_t trans_op_l =
+      trans_o ? (trans_a ? CUBLAS_OP_N : CUBLAS_OP_T) : (trans_b ? CUBLAS_OP_T : CUBLAS_OP_N);
+  cublasOperation_t trans_op_r =
+      trans_o ? (trans_b ? CUBLAS_OP_N : CUBLAS_OP_T) : (trans_a ? CUBLAS_OP_T : CUBLAS_OP_N);
+  int ldl = trans_op_l == CUBLAS_OP_N ? m : k;  // trans_o ? (trans_a ? k : m) : (trans_b ? k : m);
+  int ldr = trans_op_r == CUBLAS_OP_N ? k : n;  // trans_o ? (trans_b ? n : k) : (trans_a ? n : k);
+  int ldc = m;
+
+  int l1 = trans_o ? a1 : b1, l2 = trans_o ? a2 : b2, l3 = trans_o ? a3 : b3, l4 = trans_o ? a4 : b4;
+  int r1 = trans_o ? b1 : a1, r2 = trans_o ? b2 : a2, r3 = trans_o ? b3 : a3, r4 = trans_o ? b4 : a4;
+
+  // (N, L): L * M * K
+  // (N, 1): 1 * M * K
+  // (1, L): 0
+  // (1, 1): 0
+  int bstride_l = (l1 != 1 && l2 != 1) ? (l2 * m * k) : ((l1 != 1) ? m * k : 0);
+  int bstride_r = (r1 != 1 && r2 != 1) ? (r2 * k * n) : ((r1 != 1) ? k * n : 0);
+  int bstride_c = std::max(l2, r2) * m * n;
+  // (N, L): K * N
+  // (N, 1): 0
+  // (1, L): K * N
+  // (1, 1): 0
+  int stride_l = l2 == 1 ? 0 : l3 * l4;
+  int stride_r = r2 == 1 ? 0 : r3 * r4;
+
+  int num_gemm = ((num_args - 1) / 2);
+  std::vector<void *> ptr(3 * std::max(l1, r1) * std::max(l2, r2) * num_gemm);
+  void **ptr_a = ptr.data();
+  void **ptr_b = ptr.data() + std::max(l1, r1) * std::max(l2, r2) * num_gemm;
+  void **ptr_c = ptr.data() + std::max(l1, r1) * std::max(l2, r2) * num_gemm * 2;
+
+  void **ptr_arr        = nullptr;
+  cudaStream_t g_stream = CublasHandle::GetInstance().GetCuStream();
+  CUDA_CALL(cudaMallocAsync(&ptr_arr, sizeof(void *) * ptr.size(), g_stream));
+
+  for (int g = 0, index = 0; g < num_gemm; ++g) {
+    void *A = args[0].operator cinn_buffer_t *()->memory;
+    void *B = args[1 + g].operator cinn_buffer_t *()->memory;
+    void *C = args[1 + num_gemm + g].operator cinn_buffer_t *()->memory;
+
+    // if opside is 1, exhange A,B.
+    if (opside) {
+      auto tmp = A;
+      A        = B;
+      B        = tmp;
+    }
+
+    void *lhs = trans_o ? A : B;
+    void *rhs = trans_o ? B : A;
+
+    for (int idx = 0; idx < std::max(l1, r1); ++idx) {
+      for (int idy = 0; idy < std::max(l2, r2); ++idy) {
+        ptr_a[index] = reinterpret_cast<uint8_t *>(lhs) + (idx * bstride_l + idy * stride_l) * bytes;
+        ptr_b[index] = reinterpret_cast<uint8_t *>(rhs) + (idx * bstride_r + idy * stride_r) * bytes;
+        ptr_c[index] = reinterpret_cast<uint8_t *>(C) + (idx * bstride_c + idy * m * n) * bytes;
+        ++index;
       }
     }
   }
+
+  CUDA_CALL(cudaMemcpyAsync(ptr_arr, ptr.data(), ptr.size() * sizeof(void *), cudaMemcpyHostToDevice, g_stream));
+  CUDA_CALL(cudaStreamSynchronize(g_stream));
+
+  CUBLAS_CALL(cublasGemmBatched(cuda_dtype,
+                                cuhandle,
+                                trans_op_l,
+                                trans_op_r,
+                                m,
+                                n,
+                                k,
+                                alpha,
+                                ptr_arr,
+                                ldl,
+                                ptr_arr + std::max(l1, r1) * std::max(l2, r2) * num_gemm,
+                                ldr,
+                                beta,
+                                ptr_arr + std::max(l1, r1) * std::max(l2, r2) * 2 * num_gemm,
+                                ldc,
+                                std::max(l1, r1) * std::max(l2, r2) * num_gemm));
+  CUDA_CALL(cudaFreeAsync(ptr_arr, custream));
 }
 
 #ifdef CINN_WITH_CUDNN
@@ -269,6 +446,77 @@ class ConvAlgoMap {
   absl::flat_hash_map<std::string, int> algo_map_;
 };
 
+cudnnDataType_t convert_to_cudnn_dtype(void *v_args, int num_args) {
+  CHECK_GT(num_args, 0) << "the number of arguments must larger than zero";
+  cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
+  auto type_code         = args[0].operator cinn_buffer_t *()->type.code;
+  int bits               = args[0].operator cinn_buffer_t *()->type.bits;
+  for (int i = 1; i < num_args; ++i) {
+    auto t = args[i].operator cinn_buffer_t *()->type.code;
+    int b  = args[0].operator cinn_buffer_t *()->type.bits;
+    if (t != type_code || bits != b) {
+      LOG(FATAL) << "The types of all arguments need to be consistent.";
+    }
+  }
+  cudnnDataType_t data_type;
+  bool is_float = type_code == cinn_type_float;
+  if (is_float && bits == 16) {
+    data_type = CUDNN_DATA_HALF;
+  } else if (is_float && bits == 32) {
+    data_type = CUDNN_DATA_FLOAT;
+  } else {
+    LOG(FATAL) << "unsupported cudnn data type: " << static_cast<int>(type_code) << ", bits = " << bits;
+  }
+  return data_type;
+}
+
+cudnnDataType_t get_cudnn_compute_dtype(cudnnDataType_t data_type) {
+  switch (data_type) {
+    case CUDNN_DATA_FLOAT:
+    case CUDNN_DATA_HALF:
+      return CUDNN_DATA_FLOAT;
+    default:
+      LOG(FATAL) << "unsupported cudnn data type, only support float16 and float32 now!";
+  }
+  return CUDNN_DATA_FLOAT;
+}
+
+std::string debug_cudnn_tensor_format(cudnnTensorFormat_t tensor_format) {
+  switch (tensor_format) {
+    case CUDNN_TENSOR_NCHW:
+      return "NCHW";
+    case CUDNN_TENSOR_NHWC:
+      return "NHWC";
+    default:
+      LOG(FATAL) << "Only support NCHW and NHWC data layout\n";
+  };
+  return "";
+}
+
+std::string debug_cudnn_tensor_dtype(cudnnDataType_t tensor_dtype) {
+  switch (tensor_dtype) {
+    case CUDNN_DATA_FLOAT:
+      return "float32";
+    case CUDNN_DATA_HALF:
+      return "float16";
+    default:
+      LOG(FATAL) << "Only support float16 and float32 now!";
+  };
+  return "";
+}
+
+std::string debug_cudnn_pool_mode(cudnnPoolingMode_t pool_mode) {
+  switch (pool_mode) {
+    case CUDNN_POOLING_MAX:
+      return "max";
+    case CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING:
+      return "avg";
+    default:
+      LOG(FATAL) << "Pool only support max and avg now!";
+  };
+  return "";
+}
+
 void cinn_call_cudnn_conv2d_forward(void *v_args,
                                     int num_args,
                                     int format,
@@ -298,13 +546,12 @@ void cinn_call_cudnn_conv2d_forward(void *v_args,
   cudnnHandle_t &handle = CudnnHandle::GetInstance().GetCudnnHandle();
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
-  float *_x              = reinterpret_cast<float *>(args[0].operator cinn_buffer_t *()->memory);
-  float *_w              = reinterpret_cast<float *>(args[1].operator cinn_buffer_t *()->memory);
-  float *_y              = reinterpret_cast<float *>(args[2].operator cinn_buffer_t *()->memory);
+  void *_x               = args[0].operator cinn_buffer_t *()->memory;
+  void *_w               = args[1].operator cinn_buffer_t *()->memory;
+  void *_y               = args[2].operator cinn_buffer_t *()->memory;
 
-  CHECK_EQ(args[0].operator cinn_buffer_t *()->type.code, cinn_type_code_t::cinn_type_float);
-  cudnnDataType_t data_type         = CUDNN_DATA_FLOAT;
   cudnnTensorFormat_t tensor_format = static_cast<cudnnTensorFormat_t>(format);
+  cudnnDataType_t data_type         = convert_to_cudnn_dtype(v_args, num_args);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
@@ -316,8 +563,15 @@ void cinn_call_cudnn_conv2d_forward(void *v_args,
 
   cudnnConvolutionDescriptor_t conv_desc;
   CUDNN_CALL(cudnnCreateConvolutionDescriptor(&conv_desc));
-  CUDNN_CALL(cudnnSetConvolution2dDescriptor(
-      conv_desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, CUDNN_CROSS_CORRELATION, data_type));
+  CUDNN_CALL(cudnnSetConvolution2dDescriptor(conv_desc,
+                                             pad_h,
+                                             pad_w,
+                                             stride_h,
+                                             stride_w,
+                                             dilation_h,
+                                             dilation_w,
+                                             CUDNN_CROSS_CORRELATION,
+                                             get_cudnn_compute_dtype(data_type)));
   CUDNN_CALL(cudnnSetConvolutionGroupCount(conv_desc, groups));
   CUDNN_CALL(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
 
@@ -326,11 +580,14 @@ void cinn_call_cudnn_conv2d_forward(void *v_args,
   CUDNN_CALL(cudnnSetTensor4dDescriptor(y_desc, tensor_format, data_type, output_n, output_c, output_h, output_w));
 
   auto &conv_algo_map  = ConvAlgoMap::GetInstance();
-  std::string hash_key = "conv2d forward," + std::to_string(input_n) + "," + std::to_string(input_c) + "," +
-                         std::to_string(input_h) + "," + std::to_string(input_w) + "," + std::to_string(filter_n) +
-                         "," + std::to_string(filter_c) + "," + std::to_string(filter_h) + "," +
-                         std::to_string(filter_w) + "," + std::to_string(output_n) + "," + std::to_string(output_c) +
-                         "," + std::to_string(output_h) + "," + std::to_string(output_w);
+  std::string hash_key = "conv2d forward, layout=" + debug_cudnn_tensor_format(tensor_format) +
+                         ", dtype=" + debug_cudnn_tensor_dtype(data_type) + ", input_nchw={" + std::to_string(input_n) +
+                         "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," + std::to_string(input_w) +
+                         "}, filter_nchw={" + std::to_string(filter_n) + "," + std::to_string(filter_c) + "," +
+                         std::to_string(filter_h) + "," + std::to_string(filter_w) + "}, output_nchw={" +
+                         std::to_string(output_n) + "," + std::to_string(output_c) + "," + std::to_string(output_h) +
+                         "," + std::to_string(output_w) + "}";
+  VLOG(4) << hash_key;
   cudnnConvolutionFwdAlgo_t algo;
   int algo_int = conv_algo_map.GetAlgo(hash_key);
   if (algo_int >= 0) {
@@ -390,13 +647,12 @@ void cinn_call_cudnn_conv2d_backward_data(void *v_args,
   cudnnHandle_t &handle = CudnnHandle::GetInstance().GetCudnnHandle();
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
-  float *_w              = reinterpret_cast<float *>(args[0].operator cinn_buffer_t *()->memory);
-  float *_dy             = reinterpret_cast<float *>(args[1].operator cinn_buffer_t *()->memory);
-  float *_dx             = reinterpret_cast<float *>(args[2].operator cinn_buffer_t *()->memory);
+  void *_w               = args[0].operator cinn_buffer_t *()->memory;
+  void *_dy              = args[1].operator cinn_buffer_t *()->memory;
+  void *_dx              = args[2].operator cinn_buffer_t *()->memory;
 
-  CHECK_EQ(args[0].operator cinn_buffer_t *()->type.code, cinn_type_code_t::cinn_type_float);
-  cudnnDataType_t data_type         = CUDNN_DATA_FLOAT;
   cudnnTensorFormat_t tensor_format = static_cast<cudnnTensorFormat_t>(format);
+  cudnnDataType_t data_type         = convert_to_cudnn_dtype(v_args, num_args);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
@@ -408,8 +664,15 @@ void cinn_call_cudnn_conv2d_backward_data(void *v_args,
 
   cudnnConvolutionDescriptor_t conv_desc;
   CUDNN_CALL(cudnnCreateConvolutionDescriptor(&conv_desc));
-  CUDNN_CALL(cudnnSetConvolution2dDescriptor(
-      conv_desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, CUDNN_CROSS_CORRELATION, data_type));
+  CUDNN_CALL(cudnnSetConvolution2dDescriptor(conv_desc,
+                                             pad_h,
+                                             pad_w,
+                                             stride_h,
+                                             stride_w,
+                                             dilation_h,
+                                             dilation_w,
+                                             CUDNN_CROSS_CORRELATION,
+                                             get_cudnn_compute_dtype(data_type)));
   CUDNN_CALL(cudnnSetConvolutionGroupCount(conv_desc, groups));
   CUDNN_CALL(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
 
@@ -418,11 +681,15 @@ void cinn_call_cudnn_conv2d_backward_data(void *v_args,
   CUDNN_CALL(cudnnSetTensor4dDescriptor(y_desc, tensor_format, data_type, output_n, output_c, output_h, output_w));
 
   auto &conv_algo_map  = ConvAlgoMap::GetInstance();
-  std::string hash_key = "conv2d backward data," + std::to_string(input_n) + "," + std::to_string(input_c) + "," +
-                         std::to_string(input_h) + "," + std::to_string(input_w) + "," + std::to_string(filter_n) +
-                         "," + std::to_string(filter_c) + "," + std::to_string(filter_h) + "," +
-                         std::to_string(filter_w) + "," + std::to_string(output_n) + "," + std::to_string(output_c) +
-                         "," + std::to_string(output_h) + "," + std::to_string(output_w);
+  std::string hash_key = "conv2d backward data, layout=" + debug_cudnn_tensor_format(tensor_format) +
+                         ", dtype=" + debug_cudnn_tensor_dtype(data_type) + ", input_nchw={" + std::to_string(input_n) +
+                         "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," + std::to_string(input_w) +
+                         "}, filter_nchw={" + std::to_string(filter_n) + "," + std::to_string(filter_c) + "," +
+                         std::to_string(filter_h) + "," + std::to_string(filter_w) + "}, output_nchw={" +
+                         std::to_string(output_n) + "," + std::to_string(output_c) + "," + std::to_string(output_h) +
+                         "," + std::to_string(output_w) + "}";
+
+  VLOG(4) << hash_key;
 
   int algo_int = conv_algo_map.GetAlgo(hash_key);
   cudnnConvolutionBwdDataAlgo_t algo;
@@ -487,13 +754,12 @@ void cinn_call_cudnn_conv2d_backward_filter(void *v_args,
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
 
-  float *_x  = reinterpret_cast<float *>(args[0].operator cinn_buffer_t *()->memory);
-  float *_dy = reinterpret_cast<float *>(args[1].operator cinn_buffer_t *()->memory);
-  float *_dw = reinterpret_cast<float *>(args[2].operator cinn_buffer_t *()->memory);
+  void *_x  = args[0].operator cinn_buffer_t *()->memory;
+  void *_dy = args[1].operator cinn_buffer_t *()->memory;
+  void *_dw = args[2].operator cinn_buffer_t *()->memory;
 
-  CHECK_EQ(args[0].operator cinn_buffer_t *()->type.code, cinn_type_code_t::cinn_type_float);
-  cudnnDataType_t data_type         = CUDNN_DATA_FLOAT;
   cudnnTensorFormat_t tensor_format = static_cast<cudnnTensorFormat_t>(format);
+  cudnnDataType_t data_type         = convert_to_cudnn_dtype(v_args, num_args);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
@@ -505,8 +771,15 @@ void cinn_call_cudnn_conv2d_backward_filter(void *v_args,
 
   cudnnConvolutionDescriptor_t conv_desc;
   CUDNN_CALL(cudnnCreateConvolutionDescriptor(&conv_desc));
-  CUDNN_CALL(cudnnSetConvolution2dDescriptor(
-      conv_desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, CUDNN_CROSS_CORRELATION, data_type));
+  CUDNN_CALL(cudnnSetConvolution2dDescriptor(conv_desc,
+                                             pad_h,
+                                             pad_w,
+                                             stride_h,
+                                             stride_w,
+                                             dilation_h,
+                                             dilation_w,
+                                             CUDNN_CROSS_CORRELATION,
+                                             get_cudnn_compute_dtype(data_type)));
   CUDNN_CALL(cudnnSetConvolutionGroupCount(conv_desc, groups));
   CUDNN_CALL(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
 
@@ -515,11 +788,15 @@ void cinn_call_cudnn_conv2d_backward_filter(void *v_args,
   CUDNN_CALL(cudnnSetTensor4dDescriptor(y_desc, tensor_format, data_type, output_n, output_c, output_h, output_w));
 
   auto &algo_map       = ConvAlgoMap::GetInstance();
-  std::string hash_key = "conv2d backward filter," + std::to_string(input_n) + "," + std::to_string(input_c) + "," +
-                         std::to_string(input_h) + "," + std::to_string(input_w) + "," + std::to_string(filter_n) +
-                         "," + std::to_string(filter_c) + "," + std::to_string(filter_h) + "," +
-                         std::to_string(filter_w) + "," + std::to_string(output_n) + "," + std::to_string(output_c) +
-                         "," + std::to_string(output_h) + "," + std::to_string(output_w);
+  std::string hash_key = "conv2d backward filter, layout=" + debug_cudnn_tensor_format(tensor_format) +
+                         ", dtype=" + debug_cudnn_tensor_dtype(data_type) + ", input_nchw={" + std::to_string(input_n) +
+                         "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," + std::to_string(input_w) +
+                         "}, filter_nchw={" + std::to_string(filter_n) + "," + std::to_string(filter_c) + "," +
+                         std::to_string(filter_h) + "," + std::to_string(filter_w) + "}, output_nchw={" +
+                         std::to_string(output_n) + "," + std::to_string(output_c) + "," + std::to_string(output_h) +
+                         "," + std::to_string(output_w) + "}";
+
+  VLOG(4) << hash_key;
 
   int algo_int = algo_map.GetAlgo(hash_key);
   cudnnConvolutionBwdFilterAlgo_t algo;
@@ -580,13 +857,23 @@ void cinn_call_cudnn_pool2d_forward(void *v_args,
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
 
-  float *_x = reinterpret_cast<float *>(args[0].operator cinn_buffer_t *()->memory);
-  float *_y = reinterpret_cast<float *>(args[1].operator cinn_buffer_t *()->memory);
+  void *_x = args[0].operator cinn_buffer_t *()->memory;
+  void *_y = args[1].operator cinn_buffer_t *()->memory;
 
-  CHECK_EQ(args[0].operator cinn_buffer_t *()->type.code, cinn_type_code_t::cinn_type_float);
-  cudnnDataType_t data_type         = CUDNN_DATA_FLOAT;
   cudnnPoolingMode_t pool_mode      = static_cast<cudnnPoolingMode_t>(mode);
   cudnnTensorFormat_t tensor_format = static_cast<cudnnTensorFormat_t>(format);
+  cudnnDataType_t data_type         = convert_to_cudnn_dtype(v_args, num_args);
+
+  std::string hash_key =
+      "pool2d forward, layout=" + debug_cudnn_tensor_format(tensor_format) +
+      ", pool_type=" + debug_cudnn_pool_mode(pool_mode) + ", dtype=" + debug_cudnn_tensor_dtype(data_type) +
+      ", input_nchw={" + std::to_string(input_n) + "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," +
+      std::to_string(input_w) + "}, kernel_hw={" + std::to_string(kernel_h) + "," + std::to_string(kernel_w) +
+      "}, pad_hw={" + std::to_string(pad_h) + "," + std::to_string(pad_w) + "}, stride_hw={" +
+      std::to_string(stride_h) + "," + std::to_string(stride_w) + "}, output_nchw={" + std::to_string(output_n) + "," +
+      std::to_string(output_c) + "," + std::to_string(output_h) + "," + std::to_string(output_w) + "}";
+
+  VLOG(4) << hash_key;
 
   cudnnPoolingDescriptor_t pool_desc;
   CUDNN_CALL(cudnnCreatePoolingDescriptor(&pool_desc));
@@ -634,15 +921,25 @@ void cinn_call_cudnn_pool2d_backward(void *v_args,
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
 
-  float *_x  = reinterpret_cast<float *>((args[0].operator cinn_buffer_t *())->memory);
-  float *_y  = reinterpret_cast<float *>((args[1].operator cinn_buffer_t *())->memory);
-  float *_dy = reinterpret_cast<float *>((args[2].operator cinn_buffer_t *())->memory);
-  float *_dx = reinterpret_cast<float *>((args[3].operator cinn_buffer_t *())->memory);
+  void *_x  = args[0].operator cinn_buffer_t *()->memory;
+  void *_y  = args[1].operator cinn_buffer_t *()->memory;
+  void *_dy = args[2].operator cinn_buffer_t *()->memory;
+  void *_dx = args[3].operator cinn_buffer_t *()->memory;
 
-  CHECK_EQ(args[0].operator cinn_buffer_t *()->type.code, cinn_type_code_t::cinn_type_float);
-  cudnnDataType_t data_type         = CUDNN_DATA_FLOAT;
   cudnnPoolingMode_t pool_mode      = static_cast<cudnnPoolingMode_t>(mode);
   cudnnTensorFormat_t tensor_format = static_cast<cudnnTensorFormat_t>(format);
+  cudnnDataType_t data_type         = convert_to_cudnn_dtype(v_args, num_args);
+
+  std::string hash_key =
+      "pool2d backward, layout=" + debug_cudnn_tensor_format(tensor_format) +
+      ", pool_type=" + debug_cudnn_pool_mode(pool_mode) + ", dtype=" + debug_cudnn_tensor_dtype(data_type) +
+      ", input_nchw={" + std::to_string(input_n) + "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," +
+      std::to_string(input_w) + "}, kernel_hw={" + std::to_string(kernel_h) + "," + std::to_string(kernel_w) +
+      "}, pad_hw={" + std::to_string(pad_h) + "," + std::to_string(pad_w) + "}, stride_hw={" +
+      std::to_string(stride_h) + "," + std::to_string(stride_w) + ", output_nchw={" + std::to_string(output_n) + "," +
+      std::to_string(output_c) + "," + std::to_string(output_h) + "," + std::to_string(output_w) + "}";
+
+  VLOG(4) << hash_key;
 
   cudnnPoolingDescriptor_t pool_desc;
   CUDNN_CALL(cudnnCreatePoolingDescriptor(&pool_desc));
@@ -684,13 +981,12 @@ void cinn_call_cudnn_softmax_forward(void *v_args,
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
 
-  float *_x = reinterpret_cast<float *>((args[0].operator cinn_buffer_t *())->memory);
-  float *_y = reinterpret_cast<float *>((args[1].operator cinn_buffer_t *())->memory);
+  void *_x = args[0].operator cinn_buffer_t *()->memory;
+  void *_y = args[1].operator cinn_buffer_t *()->memory;
 
-  CHECK_EQ(args[0].operator cinn_buffer_t *()->type.code, cinn_type_code_t::cinn_type_float);
-  cudnnDataType_t data_type         = CUDNN_DATA_FLOAT;
   cudnnSoftmaxMode_t softmax_mode   = static_cast<cudnnSoftmaxMode_t>(mode);
   cudnnTensorFormat_t tensor_format = static_cast<cudnnTensorFormat_t>(format);
+  cudnnDataType_t data_type         = convert_to_cudnn_dtype(v_args, num_args);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
@@ -726,14 +1022,13 @@ void cinn_call_cudnn_softmax_backward(void *v_args,
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
   cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
 
-  float *_y  = reinterpret_cast<float *>((args[0].operator cinn_buffer_t *())->memory);
-  float *_dy = reinterpret_cast<float *>((args[1].operator cinn_buffer_t *())->memory);
-  float *_dx = reinterpret_cast<float *>((args[2].operator cinn_buffer_t *())->memory);
+  void *_y  = args[0].operator cinn_buffer_t *()->memory;
+  void *_dy = args[1].operator cinn_buffer_t *()->memory;
+  void *_dx = args[2].operator cinn_buffer_t *()->memory;
 
-  CHECK_EQ(args[0].operator cinn_buffer_t *()->type.code, cinn_type_code_t::cinn_type_float);
-  cudnnDataType_t data_type         = CUDNN_DATA_FLOAT;
   cudnnSoftmaxMode_t softmax_mode   = static_cast<cudnnSoftmaxMode_t>(mode);
   cudnnTensorFormat_t tensor_format = static_cast<cudnnTensorFormat_t>(format);
+  cudnnDataType_t data_type         = convert_to_cudnn_dtype(v_args, num_args);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
@@ -863,13 +1158,70 @@ void GemmStridedBatched(const cublasHandle_t &cublas,
 
 }  // namespace details
 
+void cinn_call_cholesky_nvgpu(void *v_args, int num_args, int batch_size, int m, bool upper, void *stream) {
+  cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
+  cinn_buffer_t *x       = args[0].operator cinn_buffer_t *();
+  cinn_buffer_t *out     = args[1].operator cinn_buffer_t *();
+  // In cuSOLVER, dense matrix stores in COL_MAJOR, thus FILL_MODE needs to be filpped.
+  // See also: https://docs.nvidia.com/cuda/cusolver/index.html#matrix-dense-format
+  cublasFillMode_t uplo = upper ? CUBLAS_FILL_MODE_LOWER : CUBLAS_FILL_MODE_UPPER;
+  size_t numel          = x->num_elements();
+  // Copy data from x to out
+  void *x_ptr   = reinterpret_cast<void *>(x->memory);
+  void *out_ptr = reinterpret_cast<void *>(out->memory);
+  CUDA_CALL(cudaMemcpy(out_ptr, x_ptr, numel * sizeof(float), cudaMemcpyDeviceToDevice));
+  // Generate pointer array
+  std::vector<float *> host_out_ptr(batch_size, nullptr);
+  for (int i = 0; i < batch_size; ++i) {
+    host_out_ptr[i] = reinterpret_cast<float *>(out_ptr) + i * m * m;
+  }
+  thrust::device_vector<float *> dev_out_ptr(host_out_ptr.begin(), host_out_ptr.end());
+  // Store the return value of each matrix
+  std::vector<int> host_info(batch_size, 0);
+  thrust::device_vector<int> dev_info(host_info.begin(), host_info.end());
+
+  cusolverDnHandle_t handler;
+  CUSOLVER_CALL(cusolverDnCreate(&handler));
+  CUSOLVER_CALL(cusolverDnSpotrfBatched(handler,
+                                        uplo,
+                                        m,
+                                        thrust::raw_pointer_cast(dev_out_ptr.data()),
+                                        m,
+                                        thrust::raw_pointer_cast(dev_info.data()),
+                                        batch_size));
+
+  // Set upper/lower triangle of matrices to 0.
+  std::vector<float> matrix(m * m, 0);
+  for (int i = 0; i < batch_size; ++i) {
+    CUDA_CALL(cudaMemcpy(matrix.data(), host_out_ptr[i], m * m * sizeof(float), cudaMemcpyDeviceToHost));
+    if (upper) {
+      for (int j = 0; j < m; j++) {
+        for (int k = 0; k < j; k++) {
+          matrix[j * m + k] = 0;
+        }
+      }
+    } else {
+      for (int j = 0; j < m; j++) {
+        for (int k = j + 1; k < m; k++) {
+          matrix[j * m + k] = 0;
+        }
+      }
+    }
+    CUDA_CALL(cudaMemcpy(host_out_ptr[i], matrix.data(), m * m * sizeof(float), cudaMemcpyHostToDevice));
+  }
+
+  // Clean
+  CUSOLVER_CALL(cusolverDnDestroy(handler));
+}
+
 void cinn_gpu_cublas_mul(const std::vector<int> &attrs,
                          cinn_buffer_t *input1,
                          cinn_buffer_t *input2,
                          cinn_buffer_t *output,
                          cudaStream_t stream) {
   cublasHandle_t &handle = CublasHandle::GetInstance().GetCublasHandle();
-  cudaStream_t custream  = static_cast<cudaStream_t>(stream);
+  CHECK_EQ(input1->type.code, cinn_type_code_t::cinn_type_float);
+  cudaStream_t custream = static_cast<cudaStream_t>(stream);
   CUBLAS_CALL(cublasSetStream(handle, custream));
   float *x_data   = reinterpret_cast<float *>(input1->memory);
   float *y_data   = reinterpret_cast<float *>(input2->memory);
@@ -897,6 +1249,7 @@ void cinn_gpu_cublas_gemm(const std::vector<int> &attrs,
   cudaStream_t custream  = static_cast<cudaStream_t>(stream);
   CUBLAS_CALL(cublasSetStream(handle, custream));
 
+  CHECK_EQ(lhs->type.code, cinn_type_code_t::cinn_type_float);
   const float *lhs_data  = reinterpret_cast<const float *>(lhs->memory);
   const float *rhs_data  = reinterpret_cast<const float *>(rhs->memory);
   const float *bias_data = bias ? reinterpret_cast<const float *>(bias->memory) : nullptr;
@@ -975,7 +1328,63 @@ void cinn_gpu_cublas_gemm(const std::vector<int> &attrs,
   }
 }
 
+void cinn_call_gaussian_random(void *v_args, int num_args, float mean, float std, int seed, void *stream) {
+  cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
+  cinn_buffer_t *output  = args[0].operator cinn_buffer_t *();
+  cinn_type_t dtype      = output->type;
+  size_t numel           = output->num_elements();
+  curandGenerator_t generator;
+  CURAND_CALL(curandCreateGenerator(&generator, CURAND_RNG_PSEUDO_PHILOX4_32_10));
+  if (seed != 0) {
+    CURAND_CALL(curandSetPseudoRandomGeneratorSeed(generator, static_cast<unsigned long long>(seed)));
+  }
+  if (dtype == cinn_float32_t()) {
+    float *ptr = reinterpret_cast<float *>(output->memory);
+    CURAND_CALL(curandGenerateNormal(generator, ptr, numel, mean, std));
+  } else if (dtype == cinn_float64_t()) {
+    double *ptr = reinterpret_cast<double *>(output->memory);
+    CURAND_CALL(curandGenerateNormalDouble(generator, ptr, numel, mean, std));
+  }
+}
+
+void cinn_call_uniform_random(void *v_args, int num_args, float min, float max, int seed, void *stream) {
+  cinn_pod_value_t *args = static_cast<cinn_pod_value_t *>(v_args);
+  cinn_buffer_t *output  = args[0].operator cinn_buffer_t *();
+  cinn_type_t dtype      = output->type;
+  size_t numel           = output->num_elements();
+  curandGenerator_t generator;
+  CURAND_CALL(curandCreateGenerator(&generator, CURAND_RNG_PSEUDO_PHILOX4_32_10));
+  if (seed != 0) {
+    CURAND_CALL(curandSetPseudoRandomGeneratorSeed(generator, static_cast<unsigned long long>(seed)));
+  }
+  if (dtype == cinn_float32_t()) {
+    float *ptr = reinterpret_cast<float *>(output->memory);
+    CURAND_CALL(curandGenerateUniform(generator, ptr, numel));
+  } else if (dtype == cinn_float64_t()) {
+    double *ptr = reinterpret_cast<double *>(output->memory);
+    CURAND_CALL(curandGenerateUniformDouble(generator, ptr, numel));
+  }
+}
+
 #ifdef CINN_WITH_CUDNN
+
+namespace {
+cudnnDataType_t convert_to_cudnn_dtype(cinn_buffer_t *input) {
+  CHECK(input) << "the pointer of input is null";
+  auto type_code = input->type.code;
+  int bits       = input->type.bits;
+  cudnnDataType_t data_type;
+  bool is_float = type_code == cinn_type_float;
+  if (is_float && bits == 16) {
+    data_type = CUDNN_DATA_HALF;
+  } else if (is_float && bits == 32) {
+    data_type = CUDNN_DATA_FLOAT;
+  } else {
+    LOG(FATAL) << "unsupported cudnn data type: " << static_cast<int>(type_code) << ", bits = " << bits;
+  }
+  return data_type;
+}
+}  // namespace
 
 #define GetAttrValue(attr_map, key_name, default_value)      \
   int key_name = 0;                                          \
@@ -1024,38 +1433,48 @@ void cinn_gpu_cudnn_conv2d(const absl::flat_hash_map<std::string, int> &attr,
 
   cudnnHandle_t &handle = CudnnHandle::GetInstance().GetCudnnHandle();
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
-  float *_x = reinterpret_cast<float *>(x->memory);
-  float *_w = reinterpret_cast<float *>(w->memory);
-  float *_y = reinterpret_cast<float *>(y->memory);
+  void *_x = x->memory;
+  void *_w = w->memory;
+  void *_y = y->memory;
+
+  auto data_type = convert_to_cudnn_dtype(x);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(x_desc, cudnn_tensor_format, CUDNN_DATA_FLOAT, input_n, input_c, input_h, input_w));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(x_desc, cudnn_tensor_format, data_type, input_n, input_c, input_h, input_w));
 
   cudnnFilterDescriptor_t w_desc;
   CUDNN_CALL(cudnnCreateFilterDescriptor(&w_desc));
-  CUDNN_CALL(cudnnSetFilter4dDescriptor(
-      w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, weights_n, weights_c, weights_h, weights_w));
+  CUDNN_CALL(
+      cudnnSetFilter4dDescriptor(w_desc, data_type, cudnn_tensor_format, weights_n, weights_c, weights_h, weights_w));
 
   cudnnConvolutionDescriptor_t conv_desc;
   CUDNN_CALL(cudnnCreateConvolutionDescriptor(&conv_desc));
-  CUDNN_CALL(cudnnSetConvolution2dDescriptor(
-      conv_desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+  CUDNN_CALL(cudnnSetConvolution2dDescriptor(conv_desc,
+                                             pad_h,
+                                             pad_w,
+                                             stride_h,
+                                             stride_w,
+                                             dilation_h,
+                                             dilation_w,
+                                             CUDNN_CROSS_CORRELATION,
+                                             get_cudnn_compute_dtype(data_type)));
   CUDNN_CALL(cudnnSetConvolutionGroupCount(conv_desc, groups));
   CUDNN_CALL(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
 
   cudnnTensorDescriptor_t y_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&y_desc));
-  CUDNN_CALL(cudnnSetTensor4dDescriptor(
-      y_desc, cudnn_tensor_format, CUDNN_DATA_FLOAT, output_n, output_c, output_h, output_w));
+  CUDNN_CALL(
+      cudnnSetTensor4dDescriptor(y_desc, cudnn_tensor_format, data_type, output_n, output_c, output_h, output_w));
 
   auto &conv_algo_map  = ConvAlgoMap::GetInstance();
-  std::string hash_key = "conv2d forward," + std::to_string(input_n) + "," + std::to_string(input_c) + "," +
-                         std::to_string(input_h) + "," + std::to_string(input_w) + "," + std::to_string(weights_n) +
-                         "," + std::to_string(weights_c) + "," + std::to_string(weights_h) + "," +
-                         std::to_string(weights_w) + "," + std::to_string(output_n) + "," + std::to_string(output_c) +
-                         "," + std::to_string(output_h) + "," + std::to_string(output_w);
+  std::string hash_key = "conv2d forward, layout=" + debug_cudnn_tensor_format(CUDNN_TENSOR_NCHW) +
+                         ", dtype=" + debug_cudnn_tensor_dtype(data_type) + ", input_nchw={" + std::to_string(input_n) +
+                         "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," + std::to_string(input_w) +
+                         "}, filter_nchw={" + std::to_string(weights_n) + "," + std::to_string(weights_c) + "," +
+                         std::to_string(weights_h) + "," + std::to_string(weights_w) + "}, output_nchw={" +
+                         std::to_string(output_n) + "," + std::to_string(output_c) + "," + std::to_string(output_h) +
+                         "," + std::to_string(output_w) + "}";
 
   cudnnConvolutionFwdAlgo_t algo;
   int algo_int = conv_algo_map.GetAlgo(hash_key);
@@ -1116,38 +1535,47 @@ void cinn_gpu_cudnn_conv2d_backward_data(const absl::flat_hash_map<std::string, 
 
   cudnnHandle_t &handle = CudnnHandle::GetInstance().GetCudnnHandle();
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
-  float *_w  = reinterpret_cast<float *>(w->memory);
-  float *_dy = reinterpret_cast<float *>(dy->memory);
-  float *_dx = reinterpret_cast<float *>(dx->memory);
+  void *_w  = w->memory;
+  void *_dy = dy->memory;
+  void *_dx = dx->memory;
+
+  auto data_type = convert_to_cudnn_dtype(w);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, input_n, input_c, input_h, input_w));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, data_type, input_n, input_c, input_h, input_w));
 
   cudnnFilterDescriptor_t w_desc;
   CUDNN_CALL(cudnnCreateFilterDescriptor(&w_desc));
-  CUDNN_CALL(cudnnSetFilter4dDescriptor(
-      w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, weights_n, weights_c, weights_h, weights_w));
+  CUDNN_CALL(
+      cudnnSetFilter4dDescriptor(w_desc, data_type, CUDNN_TENSOR_NCHW, weights_n, weights_c, weights_h, weights_w));
 
   cudnnConvolutionDescriptor_t conv_desc;
   CUDNN_CALL(cudnnCreateConvolutionDescriptor(&conv_desc));
-  CUDNN_CALL(cudnnSetConvolution2dDescriptor(
-      conv_desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+  CUDNN_CALL(cudnnSetConvolution2dDescriptor(conv_desc,
+                                             pad_h,
+                                             pad_w,
+                                             stride_h,
+                                             stride_w,
+                                             dilation_h,
+                                             dilation_w,
+                                             CUDNN_CROSS_CORRELATION,
+                                             get_cudnn_compute_dtype(data_type)));
   CUDNN_CALL(cudnnSetConvolutionGroupCount(conv_desc, groups));
   CUDNN_CALL(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
 
   cudnnTensorDescriptor_t y_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&y_desc));
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, output_n, output_c, output_h, output_w));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, data_type, output_n, output_c, output_h, output_w));
 
   auto &conv_algo_map  = ConvAlgoMap::GetInstance();
-  std::string hash_key = "conv2d backward data," + std::to_string(input_n) + "," + std::to_string(input_c) + "," +
-                         std::to_string(input_h) + "," + std::to_string(input_w) + "," + std::to_string(weights_n) +
-                         "," + std::to_string(weights_c) + "," + std::to_string(weights_h) + "," +
-                         std::to_string(weights_w) + "," + std::to_string(output_n) + "," + std::to_string(output_c) +
-                         "," + std::to_string(output_h) + "," + std::to_string(output_w);
+  std::string hash_key = "conv2d backward data, layout=" + debug_cudnn_tensor_format(CUDNN_TENSOR_NCHW) +
+                         ", dtype=" + debug_cudnn_tensor_dtype(data_type) + ", input_nchw={" + std::to_string(input_n) +
+                         "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," + std::to_string(input_w) +
+                         "}, filter_nchw={" + std::to_string(weights_n) + "," + std::to_string(weights_c) + "," +
+                         std::to_string(weights_h) + "," + std::to_string(weights_w) + "}, output_nchw={" +
+                         std::to_string(output_n) + "," + std::to_string(output_c) + "," + std::to_string(output_h) +
+                         "," + std::to_string(output_w) + "}";
 
   int algo_int = conv_algo_map.GetAlgo(hash_key);
   cudnnConvolutionBwdDataAlgo_t algo;
@@ -1211,38 +1639,47 @@ void cinn_gpu_cudnn_conv2d_backward_filter(const absl::flat_hash_map<std::string
   cudnnHandle_t &handle = CudnnHandle::GetInstance().GetCudnnHandle();
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
 
-  float *_x  = reinterpret_cast<float *>(x->memory);
-  float *_dy = reinterpret_cast<float *>(dy->memory);
-  float *_dw = reinterpret_cast<float *>(dw->memory);
+  void *_x  = x->memory;
+  void *_dy = dy->memory;
+  void *_dw = dw->memory;
+
+  auto data_type = convert_to_cudnn_dtype(x);
 
   cudnnTensorDescriptor_t x_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&x_desc));
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, input_n, input_c, input_h, input_w));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, data_type, input_n, input_c, input_h, input_w));
 
   cudnnFilterDescriptor_t w_desc;
   CUDNN_CALL(cudnnCreateFilterDescriptor(&w_desc));
-  CUDNN_CALL(cudnnSetFilter4dDescriptor(
-      w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, weights_n, weights_c, weights_h, weights_w));
+  CUDNN_CALL(
+      cudnnSetFilter4dDescriptor(w_desc, data_type, CUDNN_TENSOR_NCHW, weights_n, weights_c, weights_h, weights_w));
 
   cudnnConvolutionDescriptor_t conv_desc;
   CUDNN_CALL(cudnnCreateConvolutionDescriptor(&conv_desc));
-  CUDNN_CALL(cudnnSetConvolution2dDescriptor(
-      conv_desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+  CUDNN_CALL(cudnnSetConvolution2dDescriptor(conv_desc,
+                                             pad_h,
+                                             pad_w,
+                                             stride_h,
+                                             stride_w,
+                                             dilation_h,
+                                             dilation_w,
+                                             CUDNN_CROSS_CORRELATION,
+                                             get_cudnn_compute_dtype(data_type)));
   CUDNN_CALL(cudnnSetConvolutionGroupCount(conv_desc, groups));
   CUDNN_CALL(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
 
   cudnnTensorDescriptor_t y_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&y_desc));
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, output_n, output_c, output_h, output_w));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, data_type, output_n, output_c, output_h, output_w));
 
   auto &algo_map       = ConvAlgoMap::GetInstance();
-  std::string hash_key = "conv2d backward filter," + std::to_string(input_n) + "," + std::to_string(input_c) + "," +
-                         std::to_string(input_h) + "," + std::to_string(input_w) + "," + std::to_string(weights_n) +
-                         "," + std::to_string(weights_c) + "," + std::to_string(weights_h) + "," +
-                         std::to_string(weights_w) + "," + std::to_string(output_n) + "," + std::to_string(output_c) +
-                         "," + std::to_string(output_h) + "," + std::to_string(output_w);
+  std::string hash_key = "conv2d backward filter, layout=" + debug_cudnn_tensor_format(CUDNN_TENSOR_NCHW) +
+                         ", dtype=" + debug_cudnn_tensor_dtype(data_type) + ", input_nchw={" + std::to_string(input_n) +
+                         "," + std::to_string(input_c) + "," + std::to_string(input_h) + "," + std::to_string(input_w) +
+                         "}, filter_nchw={" + std::to_string(weights_n) + "," + std::to_string(weights_c) + "," +
+                         std::to_string(weights_h) + "," + std::to_string(weights_w) + "}, output_nchw={" +
+                         std::to_string(output_n) + "," + std::to_string(output_c) + "," + std::to_string(output_h) +
+                         "," + std::to_string(output_w) + "}";
 
   int algo_int = algo_map.GetAlgo(hash_key);
   cudnnConvolutionBwdFilterAlgo_t algo;
@@ -1320,6 +1757,8 @@ void cinn_gpu_cudnn_pool2d(const std::vector<int> &attrs,
     kernel_w = input_w - (output_w - 1) * stride_w;
   }
 
+  auto data_type = convert_to_cudnn_dtype(input);
+
   CUDNN_CALL(cudnnSetPooling2dDescriptor(
       pooling_desc, pool_mode, CUDNN_NOT_PROPAGATE_NAN, kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w));
 
@@ -1327,21 +1766,20 @@ void cinn_gpu_cudnn_pool2d(const std::vector<int> &attrs,
 
   CUDNN_CALL(cudnnCreateTensorDescriptor(&in_desc));
 
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(in_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, input_n, input_c, input_h, input_w));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(in_desc, CUDNN_TENSOR_NCHW, data_type, input_n, input_c, input_h, input_w));
 
   cudnnTensorDescriptor_t out_desc;
 
   CUDNN_CALL(cudnnCreateTensorDescriptor(&out_desc));
 
-  CUDNN_CALL(cudnnSetTensor4dDescriptor(
-      out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, output_n, output_c, output_h, output_w));
+  CUDNN_CALL(
+      cudnnSetTensor4dDescriptor(out_desc, CUDNN_TENSOR_NCHW, data_type, output_n, output_c, output_h, output_w));
 
   float alpha = 1.0f;
   float beta  = 0.0f;
 
-  float *in_data  = reinterpret_cast<float *>(input->memory);
-  float *out_data = reinterpret_cast<float *>(output->memory);
+  void *in_data  = input->memory;
+  void *out_data = output->memory;
 
   CUDNN_CALL(cudnnPoolingForward(handle, pooling_desc, &alpha, in_desc, in_data, &beta, out_desc, out_data));
 
@@ -1371,20 +1809,20 @@ void cinn_gpu_cudnn_softmax(const std::vector<int> &attrs,
   }
   rank = shape.size();
 
+  auto data_type = convert_to_cudnn_dtype(input);
+
   cudnnHandle_t &handle = CudnnHandle::GetInstance().GetCudnnHandle();
   CUDNN_CALL(cudnnSetStream(handle, static_cast<cudaStream_t>(stream)));
-  float *in_data  = reinterpret_cast<float *>(input->memory);
-  float *out_data = reinterpret_cast<float *>(output->memory);
+  void *in_data  = input->memory;
+  void *out_data = output->memory;
 
   cudnnTensorDescriptor_t in_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&in_desc));
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(in_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, outer_num, shape[axis], inner_num, 1));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(in_desc, CUDNN_TENSOR_NCHW, data_type, outer_num, shape[axis], inner_num, 1));
 
   cudnnTensorDescriptor_t out_desc;
   CUDNN_CALL(cudnnCreateTensorDescriptor(&out_desc));
-  CUDNN_CALL(
-      cudnnSetTensor4dDescriptor(out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, outer_num, shape[axis], inner_num, 1));
+  CUDNN_CALL(cudnnSetTensor4dDescriptor(out_desc, CUDNN_TENSOR_NCHW, data_type, outer_num, shape[axis], inner_num, 1));
 
   float alpha = 1.f;
   float beta  = 0.f;

@@ -64,6 +64,8 @@ class TransposeCollapsingPass : public ProgramPass {
   using InputToOpMap  = std::unordered_map<std::string, std::unordered_set<Instruction*>>;
 
  protected:
+  void Clear() override {}
+
   void ApplyImpl(Program* program,
                  const std::unordered_set<std::string>& fetch_ids,
                  const common::Target& target) const override {
@@ -97,7 +99,10 @@ class TransposeCollapsingPass : public ProgramPass {
         all_transpose.erase(instr);
       }
     }
-    FoldingTransposeHorizontal(all_transpose, fetch_ids, in2instr, out2instr, &remove_instrs);
+    // TODO(thisjiang): reopen after CINN support recompute for performance
+    // due to recompute unsupported, if the op output to two group, it will also create a new group,
+    // so that the horizontal fuse will not improve performance.
+    // FoldingTransposeHorizontal(all_transpose, fetch_ids, in2instr, out2instr, &remove_instrs);
 
     NetBuilder builder("transpose_collapsing_builder");
     for (auto& var : program->GetInputs()) {
@@ -289,8 +294,12 @@ class TransposeCollapsingPass : public ProgramPass {
 
   // if the transpose axis like {0, 1, 2, 3, 4, 5}, the transpose is useless, should remove
   bool CheckTransposeUseless(const ShapeType& axis) const {
-    if (axis.front() != 0) return false;
-    return std::is_sorted(axis.begin(), axis.end(), [](DimType dim1, DimType dim2) { return dim1 + 1 == dim2; });
+    for (int i = 0; i < axis.size(); ++i) {
+      if (axis[i] != i) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // replace the op's input variable whose name is `old_input_name` to `new_input`, note we need keep the input list
